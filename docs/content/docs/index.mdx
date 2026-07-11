@@ -1,0 +1,176 @@
+---
+title: Introduction
+description: A safe, Native-AOT-compatible managed wrapper over the native .NET hosting components.
+---
+
+**HostFxrSharp** is a safe, idiomatic, **Native-AOT-compatible** managed wrapper over the native .NET
+hosting components — [`nethost`](/docs/guide/locating-hostfxr) and `hostfxr`. It lets you locate the
+hosting library, start the .NET runtime, and run or load managed code entirely from clean C#, on
+**Windows, Linux, and macOS**.
+
+The native hosting APIs are a low-level C surface: manual buffer protocols, `char_t` strings whose
+encoding depends on the platform, opaque handles with strict lifetimes, and integer status codes.
+HostFxrSharp hides all of that behind a small, strongly-typed API — you call methods, receive
+`string`s and objects, and failures arrive as structured [exceptions](/docs/guide/error-handling).
+
+## Why HostFxrSharp
+
+- **Native-AOT friendly.** Every native access goes through source-generated P/Invokes and unmanaged
+  function pointers. The only managed-to-native callback — the diagnostic error writer — uses a
+  static `[UnmanagedCallersOnly]` trampoline, so the entire surface is
+  [Native-AOT compatible](/docs/native-aot).
+- **Cross-platform.** One API for Windows, Linux, and macOS. Native strings are marshalled per
+  platform, so you never deal with `char_t` encoding yourself. See [Cross-platform](/docs/cross-platform).
+- **Safe and idiomatic.** Native status codes map to [structured exceptions](/docs/guide/error-handling),
+  and native handles are wrapped in `SafeHandle`-based lifetimes so a runtime is never leaked.
+
+## Features
+
+- **Locate and load `hostfxr`** through `nethost`, or from an explicit path with no `nethost`
+  present — see [Locating hostfxr](/docs/guide/locating-hostfxr).
+- **Initialize [host contexts](/docs/guide/host-contexts)** for a command line (`app.dll …`) or a
+  `.runtimeconfig.json` component.
+- **[Run managed applications](/docs/guide/running-apps)** by starting the .NET runtime and returning
+  the app's exit code.
+- **[Load assemblies](/docs/guide/loading-assemblies)** and resolve native function pointers to managed
+  static methods.
+- **Read and write [runtime properties](/docs/guide/runtime-properties)** before the runtime starts.
+- **Install a process-wide diagnostic error writer** to capture host messages.
+
+## Installation
+
+Add the package to your project:
+
+```sh
+dotnet add package HostFxrSharp
+```
+
+HostFxrSharp targets .NET 10 and supports both JIT and Native-AOT publishing.
+
+## Quick example
+
+Initialize the process runtime for a managed application and run it:
+
+```csharp
+using HostFxrSharp;
+
+// Locate + load hostfxr, then initialize the process runtime for a managed app.
+using var app = HostFxr.InitializeForCommandLine(["MyApp.dll", "--verbose"]);
+
+// Start the .NET runtime and run the application; returns its exit code.
+int exitCode = app.RunApp();
+```
+
+The collection expression is a `string[]` of the app's command-line arguments, exactly as `hostfxr`
+expects: the managed entry assembly first (`app.dll`), followed by its arguments. SDK commands such as
+`dotnet run` are not supported.
+
+<Callout type="info">
+`HostFxr.InitializeForCommandLine` implicitly loads `hostfxr` for you (via `nethost`) on first use. To
+control discovery, call `HostFxr.EnsureLoaded` or `HostFxr.LoadFrom` first, or pass resolution options —
+see [Locating hostfxr](/docs/guide/locating-hostfxr).
+</Callout>
+
+## Two ways to initialize
+
+`HostFxr` exposes two entry points, mirroring the native hosting API. Both return a
+[`HostContext`](/docs/guide/host-contexts).
+
+| Entry point | Native call | Use for |
+| --- | --- | --- |
+| `HostFxr.InitializeForCommandLine(args, options)` | `hostfxr_initialize_for_dotnet_command_line` | Running a managed application (`app.dll …`). Supports framework-dependent and self-contained apps. Can only succeed once per process. |
+| `HostFxr.InitializeForRuntimeConfig(path, options)` | `hostfxr_initialize_for_runtime_config` | Loading a framework-dependent component from its `.runtimeconfig.json`. May be called multiple times, and is safe to call concurrently. |
+
+Both accept an optional `HostContextOptions` (`HostPath`, `DotNetRoot`, and nested `Resolution`
+options) from the `HostFxrSharp.Contexts` namespace.
+
+## Load a component into the runtime
+
+Instead of running a whole application, you can start the runtime from a component's
+`.runtimeconfig.json` and resolve a native function pointer to one of its managed static methods.
+
+<Steps>
+
+<Step>
+### Initialize a host context for the component
+
+Point at the component's `.runtimeconfig.json`. This is the framework-dependent component path and may
+be called more than once per process.
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Contexts;
+using HostFxrSharp.Loading;
+
+using HostContext component = HostFxr.InitializeForRuntimeConfig("MyComponent.runtimeconfig.json");
+```
+</Step>
+
+<Step>
+### Get the isolated-load helper
+
+Requesting a runtime delegate starts the runtime. `GetAssemblyFunctionPointerLoader` wraps
+`load_assembly_and_get_function_pointer`, loading the target into an isolated `AssemblyLoadContext`.
+
+```csharp
+AssemblyFunctionPointerLoader loader = component.GetAssemblyFunctionPointerLoader();
+```
+</Step>
+
+<Step>
+### Resolve a native pointer to a managed method
+
+Pass the assembly path, the assembly-qualified type name, and the name of a `static` method. The
+returned `nint` is a raw function pointer with process lifetime — no managed delegate marshalling, so it
+stays Native-AOT compatible.
+
+```csharp
+nint entryPoint = loader.Load(
+    assemblyPath: "MyComponent.dll",
+    typeName:     "MyComponent.Entry, MyComponent",
+    methodName:   "Run");
+```
+</Step>
+
+</Steps>
+
+<Callout type="info">
+`GetAssemblyFunctionPointerLoader` is one of four typed loaders. `GetFunctionPointerResolver`,
+`GetAssemblyLoader`, and `GetAssemblyBytesLoader` cover the default-`AssemblyLoadContext` scenarios —
+see [Loading assemblies](/docs/guide/loading-assemblies).
+</Callout>
+
+## Native behavior you should know
+
+HostFxrSharp is a thin, faithful wrapper — it does not paper over the fundamental rules of the native
+hosting components. Keep these in mind.
+
+<Callout type="warn">
+**One runtime per process.** Only a single .NET runtime can be loaded per process. The first
+initialized context owns it; subsequent `InitializeForRuntimeConfig` calls attach to the existing
+runtime as secondary contexts (`HostContext.Kind`). Attempting to load a second, incompatible runtime
+throws `RuntimeAlreadyLoadedException`.
+</Callout>
+
+<Callout type="warn">
+**Properties become read-only once the runtime starts.** You may read and write
+[runtime properties](/docs/guide/runtime-properties) on the first context via `HostContext.Properties`
+before it starts the runtime. Once the runtime is running — after a runtime delegate is requested or
+`RunApp` is called — properties are read-only; use `HostFxr.GetActiveRuntimeProperties` or
+`HostFxr.TryGetActiveRuntimeProperty` to inspect the active runtime.
+</Callout>
+
+<Callout type="info">
+**`char_t` is platform-specific.** Native host strings are UTF-16 on Windows and UTF-8 on Unix.
+HostFxrSharp marshals per platform, so your C# code always works with ordinary `string` values — see
+[Cross-platform](/docs/cross-platform).
+</Callout>
+
+## Next steps
+
+<Cards>
+  <Card title="Getting started" href="/docs/getting-started" description="A complete, runnable walkthrough from install to running an app." />
+  <Card title="How hosting works" href="/docs/concepts" description="The mental model behind nethost, hostfxr, and host contexts." />
+  <Card title="Loading assemblies" href="/docs/guide/loading-assemblies" description="Load components and resolve native pointers to managed static methods." />
+  <Card title="API reference" href="/docs/api-reference" description="Every public type and member in HostFxrSharp." />
+</Cards>

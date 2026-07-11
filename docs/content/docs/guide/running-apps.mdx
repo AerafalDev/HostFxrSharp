@@ -1,0 +1,269 @@
+---
+title: Running applications
+description: Run a managed application through the native host and read its exit code.
+---
+
+Running a managed application is the most direct thing you can do with the hosting components: hand `hostfxr` a command line, let it locate and start the .NET runtime, and let it invoke the application's entry point. HostFxrSharp exposes this as two calls — `HostFxr.InitializeForCommandLine` to create a [host context](/docs/guide/host-contexts), then `HostContext.RunApp` to run it and return the exit code.
+
+This is the managed equivalent of launching an app through its `apphost` (the generated `MyApp.exe`) or via `dotnet MyApp.dll`. It works for both framework-dependent and self-contained applications, on Windows, Linux, and macOS.
+
+## The two steps
+
+Initialization builds the host context; `RunApp` starts the runtime and blocks until the application's `Main` returns.
+
+<Steps>
+
+<Step>
+
+### Initialize a command-line context
+
+`HostFxr.InitializeForCommandLine` locates and loads `hostfxr` (via `nethost`) on first use, then initializes the process runtime for a managed app. It returns the first [host context](/docs/guide/host-contexts).
+
+```csharp
+using HostFxrSharp;
+
+// Locate + load hostfxr (via nethost), then initialize the process runtime for a managed app.
+using var app = HostFxr.InitializeForCommandLine(["MyApp.dll", "--verbose"]);
+```
+
+</Step>
+
+<Step>
+
+### Run the app and read the exit code
+
+`RunApp` starts the .NET runtime, invokes the entry point, and blocks until the application exits, returning its exit code as an `int`.
+
+```csharp
+// Start the .NET runtime and run the entry point; blocks until the app exits.
+int exitCode = app.RunApp();
+
+return exitCode;
+```
+
+</Step>
+
+</Steps>
+
+`InitializeForCommandLine` implicitly loads `hostfxr` for you on first use (through `nethost`), so you do not have to call `HostFxr.EnsureLoaded` yourself. To control discovery — or to avoid `nethost` entirely — call `HostFxr.EnsureLoaded` / `HostFxr.LoadFrom` first, or pass resolution options; see [Locating hostfxr](/docs/guide/locating-hostfxr).
+
+<Callout type="info">
+  `RunApp` only works on a context created by `InitializeForCommandLine`. Calling it on a context created from a `.runtimeconfig.json` throws `InvalidOperationException`. To load a component and call into it instead of running an app, see [Loading assemblies](/docs/guide/loading-assemblies).
+</Callout>
+
+## The `args` array
+
+The argument array is passed straight through to `hostfxr_initialize_for_dotnet_command_line`. Its shape mirrors what you would type on the command line after `dotnet`: the **managed entry assembly first**, followed by the arguments to forward to the application.
+
+```csharp
+// Equivalent to:  dotnet MyApp.dll --input data.json --verbose
+using var app = HostFxr.InitializeForCommandLine(
+[
+    "MyApp.dll",        // [0] the managed entry assembly
+    "--input",          // [1..] arguments forwarded to the app
+    "data.json",
+    "--verbose",
+]);
+```
+
+| Element | Meaning |
+| --- | --- |
+| `args[0]` | The managed entry assembly (for example `MyApp.dll`), typically an absolute or app-relative path. |
+| `args[1..]` | The command-line arguments delivered to the application's `Main(string[])`. |
+
+These strings are marshalled to native `char_t` for you — UTF-16 on Windows, UTF-8 on Unix — so you always work with ordinary .NET `string` values. See [Cross-platform](/docs/cross-platform).
+
+<Callout type="warn">
+  SDK commands are not supported. The command line must name a runnable managed assembly, not an SDK verb: `dotnet run`, `dotnet build`, `dotnet test`, and similar require the .NET SDK's command resolver, which this API does not drive. Passing such a command line fails initialization with a `HostingException`.
+</Callout>
+
+## Framework-dependent vs. self-contained apps
+
+`RunApp` supports both deployment models. The difference is *where the runtime comes from* — and, consequently, *which `hostfxr` you should load*.
+
+| | Framework-dependent | Self-contained |
+| --- | --- | --- |
+| Runtime source | A shared framework from the machine's .NET install | A private copy shipped alongside the app |
+| `coreclr` location | In the shared framework directory | Next to the app (and its own `hostfxr`) |
+| Which `hostfxr` to use | The machine install's `hostfxr` (found by `nethost`) | The app-local `hostfxr` shipped with the app |
+| `RunApp` supported | Yes | Yes |
+
+For a **framework-dependent** app the default path just works: `nethost` finds the machine's `hostfxr`, and `hostfxr` resolves the required shared framework (respecting `DOTNET_ROOT` or the `DotNetRoot` option). A missing framework surfaces as a `FrameworkMissingFailure` status.
+
+```csharp
+using HostFxrSharp;
+
+// Framework-dependent: nethost discovers the machine hostfxr; hostfxr resolves the shared framework.
+using var app = HostFxr.InitializeForCommandLine(["MyApp.dll"]);
+return app.RunApp();
+```
+
+For a **self-contained** app, the app ships its own `hostfxr` next to `coreclr`. Load *that* copy explicitly with `HostFxr.LoadFrom` so the self-contained layout is honored, instead of letting `nethost` resolve a machine install that knows nothing about the private runtime.
+
+```csharp
+using HostFxrSharp;
+
+// Self-contained: load the hostfxr that ships with the app, bypassing nethost discovery.
+HostFxr.LoadFrom(@"C:\apps\MyApp\hostfxr.dll");
+
+using var app = HostFxr.InitializeForCommandLine([@"C:\apps\MyApp\MyApp.dll"]);
+return app.RunApp();
+```
+
+<Callout type="info">
+  When `DotNetRoot` is not supplied, `hostfxr` auto-detects the install layout from its own location — treating the deployment as self-contained when `coreclr` sits next to it, and as a relative machine install otherwise. This is why loading the *correct* `hostfxr` matters for self-contained apps.
+</Callout>
+
+<Callout type="info">
+  Only [`InitializeForRuntimeConfig`](/docs/guide/host-contexts) rejects self-contained deployments (it requires a framework-dependent component). Running an app with `InitializeForCommandLine` accepts both.
+</Callout>
+
+## One run per process
+
+The hosting components allow a single .NET runtime per process, and that constraint shapes the whole lifecycle:
+
+- **The first context owns the runtime.** The first initialized [host context](/docs/guide/host-contexts) loads and owns the runtime (`HostContextKind.First`). A second attempt to initialize a *command-line* context — which would load a distinct runtime — throws `RuntimeAlreadyLoadedException`.
+- **`RunApp` runs at most once per context.** A second `RunApp` on the same context throws `InvalidOperationException`. Combined with the single-runtime rule, this means an application runs effectively once per process.
+- **Starting the runtime freezes its properties.** `RunApp` starts the runtime; from that point the context's [runtime properties](/docs/guide/runtime-properties) are read-only.
+
+Because runtime configuration must be finalized *before* the runtime starts, set any properties between initialization and `RunApp`:
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Contexts;
+
+using HostContext app = HostFxr.InitializeForCommandLine(["MyApp.dll"]);
+
+// Writable only on the first context, and only before the runtime starts.
+if (app.Properties.CanModify)
+    app.Properties.Set("System.GC.Server", "true");
+
+int exitCode = app.RunApp(); // starts the runtime; Properties are now read-only
+return exitCode;
+```
+
+See [Runtime properties](/docs/guide/runtime-properties) for the full accessor, including reading the already-running runtime's properties after startup.
+
+## Exit codes
+
+`RunApp` blocks until the application finishes and returns an `int`:
+
+- On a **normal exit**, it returns the value the application's `Main` returned (or `0` when `Main` is `void` and completes without an unhandled exception).
+- On a **host-layer startup failure** — for example a missing shared framework — it returns the corresponding native status value rather than throwing. These are the high-bit `0x8xxxxxxx` codes from [`HostStatusCode`](/docs/api-reference), which read as negative `int`s.
+
+Because host-startup failures come back as `HostStatusCode` values, you can classify the return with the built-in helper. A negative result never overlaps with a normal (non-negative) process exit code, so it is a reliable signal that the host failed before the app ran:
+
+```csharp
+using HostFxrSharp;
+
+using var app = HostFxr.InitializeForCommandLine(["MyApp.dll"]);
+
+int result = app.RunApp();
+var code = (HostStatusCode)result;
+
+if (code.IsFailure())
+    Console.Error.WriteLine($"Host failed to start the app: {code}");
+else
+    Console.WriteLine($"Application exited with code {result}.");
+
+return result;
+```
+
+A few native statuses you may see returned this way:
+
+| Status | Meaning |
+| --- | --- |
+| `FrameworkMissingFailure` | A required shared framework is not installed. |
+| `AppArgNotRunnable` | The named assembly is not a runnable application. |
+| `CoreClrInitFailure` | The runtime failed to initialize. |
+
+<Callout type="info">
+  Failures detected *during initialization* (before `RunApp`) are thrown as [exceptions](/docs/guide/error-handling), not returned as exit codes. `RunApp`'s numeric return covers the application's own exit code and any failure that occurs once the run has begun.
+</Callout>
+
+## Passing host options
+
+`HostContextOptions` lets you override how `hostfxr` sees the host and the .NET install. All members are optional.
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Contexts;
+
+var options = new HostContextOptions
+{
+    // Path reported to CoreCLR as the executable path (need not be a real .exe).
+    HostPath = @"C:\apps\MyApp\MyApp.exe",
+
+    // Root of the .NET install to use; auto-detected from hostfxr's location when omitted.
+    DotNetRoot = @"C:\Program Files\dotnet",
+};
+
+using HostContext app = HostFxr.InitializeForCommandLine(["MyApp.dll"], options);
+return app.RunApp();
+```
+
+| Option | Purpose |
+| --- | --- |
+| `HostPath` | Path passed to CoreCLR as the executable path. It need not be an executable file. |
+| `DotNetRoot` | Root of the .NET installation to use; when unset, `hostfxr` auto-detects it from its own location. |
+| `Resolution` | `hostfxr` discovery options, used only if this library still has to locate/load `hostfxr`. See [Locating hostfxr](/docs/guide/locating-hostfxr). |
+
+## Handling failures
+
+Initialization and disposal follow HostFxrSharp's structured [error-handling](/docs/guide/error-handling) model: failures are typed exceptions derived from `HostingException`, with the originating native status preserved on `StatusCode`.
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Contexts;
+using HostFxrSharp.Exceptions;
+
+try
+{
+    using HostContext app = HostFxr.InitializeForCommandLine(["MyApp.dll"]);
+    return app.RunApp();
+}
+catch (RuntimeAlreadyLoadedException)
+{
+    // Another runtime already owns this process; a command-line app cannot be started here.
+    Console.Error.WriteLine("A .NET runtime is already loaded in this process.");
+    return 1;
+}
+catch (HostingException ex)
+{
+    // Initialization failed (bad config, missing framework, invalid command line, ...).
+    Console.Error.WriteLine($"Hosting failure ({ex.StatusCode}): {ex.Message}");
+    return 1;
+}
+```
+
+<Callout type="warn">
+  Always dispose the context. A `using` declaration is enough. The native handle is a `SafeHandle`, so `hostfxr_close` runs exactly once even if disposal is missed — but an abandoned *first* context can block future initializations at the native layer, so deterministic disposal matters.
+</Callout>
+
+To see diagnostic messages the hosting components emit during a failed run, install a process-wide error writer with `HostFxr.SetErrorWriter` before initializing:
+
+```csharp
+using HostFxrSharp;
+
+using IDisposable writer = HostFxr.SetErrorWriter(msg => Console.Error.WriteLine($"[hostfxr] {msg}"));
+
+using var app = HostFxr.InitializeForCommandLine(["MyApp.dll"]);
+return app.RunApp();
+```
+
+## Threading and Native AOT
+
+- **Not thread-safe.** A `HostContext` wraps a native handle that is not thread-safe: call at most one method at a time, from a single thread. `RunApp` blocks the calling thread for the duration of the application.
+- **Native-AOT friendly.** All native access uses source-generated P/Invokes and unmanaged function pointers; the only managed-to-native callback (the diagnostic error writer) uses a static `[UnmanagedCallersOnly]` trampoline. The whole running-an-app path is AOT-safe — see [Native AOT](/docs/native-aot).
+
+## Next steps
+
+<Cards>
+  <Card title="Getting started" href="/docs/getting-started" description="A complete, runnable walkthrough from install to first run." />
+  <Card title="How hosting works" href="/docs/concepts" description="The mental model behind nethost, hostfxr, and host contexts." />
+  <Card title="Host contexts" href="/docs/guide/host-contexts" description="Initialization, kinds, and lifetime of a host context." />
+  <Card title="Runtime properties" href="/docs/guide/runtime-properties" description="Configuring the runtime before it starts." />
+  <Card title="Loading assemblies" href="/docs/guide/loading-assemblies" description="Call into managed code instead of running an app." />
+  <Card title="Error handling" href="/docs/guide/error-handling" description="The exception hierarchy and native status codes." />
+  <Card title="API reference" href="/docs/api-reference" description="Every public type and member." />
+</Cards>

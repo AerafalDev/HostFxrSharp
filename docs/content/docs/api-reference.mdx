@@ -1,0 +1,630 @@
+---
+title: API reference
+description: A curated reference of every public type and member in HostFxrSharp.
+---
+
+A curated tour of the public surface of **HostFxrSharp**. Every type, member, and code
+sample below is taken directly from the library — nothing here is invented. For task-oriented
+walkthroughs, start with [Getting started](/docs/getting-started) and
+[How hosting works](/docs/concepts); this page is the reference you return to.
+
+The public API lives in five namespaces:
+
+| Namespace | Contents |
+| --- | --- |
+| `HostFxrSharp` | The entry points [`NetHost`](#nethost) and [`HostFxr`](#hostfxr), the [`HostStatusCode`](#hoststatuscode) enum with its [classification helpers](#hostingstatuscodeextensions), and the `HostErrorWriter` delegate. |
+| `HostFxrSharp.Contexts` | [`HostContext`](#hostcontext) and its supporting types — [`RuntimeProperties`](#runtimeproperties), [`HostContextKind`](#hostcontextkind), [`RuntimePropertyConflict`](#runtimepropertyconflict), [`HostContextOptions`](#hostcontextoptions). |
+| `HostFxrSharp.Resolution` | [`HostFxrResolutionOptions`](#hostfxrresolutionoptions) — how `nethost` locates `hostfxr`. |
+| `HostFxrSharp.Loading` | The typed runtime-delegate wrappers and their descriptors — see [Loading](#loading). |
+| `HostFxrSharp.Exceptions` | The [structured exception hierarchy](#exception-hierarchy). |
+
+<Callout type="info">
+  **Native behavior, in one place.** HostFxrSharp is a thin, faithful wrapper. It marshals native
+  `char_t` strings per platform (UTF-16 on Windows, UTF-8 on Unix), enforces the *single runtime per
+  process* rule, and honors the runtime's *properties become read-only once it starts* contract. The
+  entire surface is [Native-AOT compatible](/docs/native-aot): every native access goes through
+  source-generated P/Invokes and unmanaged function pointers, and the one managed-to-native callback
+  uses a static `[UnmanagedCallersOnly]` trampoline.
+</Callout>
+
+## Typical flow
+
+The types below compose into one sequence: locate the native host, initialize a context, optionally
+tune runtime properties, then start the runtime to run an app or load managed code.
+
+<Steps>
+<Step>
+**Locate and load `hostfxr`.** [`NetHost.GetHostFxrPath`](#nethost) finds the library via `nethost`;
+[`HostFxr.EnsureLoaded`](#hostfxr) (or [`HostFxr.LoadFrom`](#hostfxr)) loads it once per process.
+This step is implicit — the `Initialize*` methods perform it on demand.
+</Step>
+<Step>
+**Initialize a [`HostContext`](#hostcontext).** Call
+[`HostFxr.InitializeForCommandLine`](#hostfxr) to run a managed application, or
+[`HostFxr.InitializeForRuntimeConfig`](#hostfxr) to host a component from its `.runtimeconfig.json`.
+</Step>
+<Step>
+**Inspect or modify [runtime properties](#runtimeproperties)** through `context.Properties` — but only
+before the runtime starts, and only on the [`First`](#hostcontextkind) context.
+</Step>
+<Step>
+**Start the runtime.** Calling [`RunApp`](#hostcontext) or requesting any
+[loader / runtime delegate](#loading) starts the runtime; after that, properties become read-only.
+</Step>
+</Steps>
+
+## Entry points
+
+The `HostFxrSharp` namespace exposes two static entry points.
+
+| Type | Summary |
+| --- | --- |
+| [`NetHost`](#nethost) | Locates the `hostfxr` library via the native `nethost` component. |
+| [`HostFxr`](#hostfxr) | Loads `hostfxr`, initializes [host contexts](#hostcontext), reads active runtime properties, and installs a diagnostic error writer. |
+
+### NetHost
+
+`public static class NetHost` — locates `hostfxr` and returns its full path. The native
+size-then-fill buffer protocol of `get_hostfxr_path` is handled internally; callers just receive a
+`string`.
+
+| Member | Summary |
+| --- | --- |
+| `static string GetHostFxrPath(HostFxrResolutionOptions? options = null)` | Locates `hostfxr` and returns its absolute path. Throws `HostFxrNotFoundException` if it cannot be located, or `HostFxrResolutionException` for another failure. |
+| `static bool TryGetHostFxrPath(out string? path, HostFxrResolutionOptions? options = null)` | Non-throwing variant. Returns `true` and sets `path` on success; returns `false` (with `path` null) if any `HostingException` occurs. |
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Resolution;
+
+// Locate hostfxr through the native nethost component.
+string hostFxrPath = NetHost.GetHostFxrPath();
+Console.WriteLine(hostFxrPath);
+
+// Or steer discovery at a specific .NET installation, without throwing.
+var options = new HostFxrResolutionOptions { DotNetRoot = @"C:\Program Files\dotnet" };
+
+if (NetHost.TryGetHostFxrPath(out string? path, options))
+    Console.WriteLine($"hostfxr: {path}");
+```
+
+See [Locating hostfxr](/docs/guide/locating-hostfxr) for how discovery works and when to supply options.
+
+### HostFxr
+
+`public static class HostFxr` — the primary entry point for loading `hostfxr` and initializing host
+contexts. `hostfxr` is located (via [`NetHost`](#nethost)) and loaded once per process.
+
+| Member | Summary |
+| --- | --- |
+| `static string? LoadedHostFxrPath { get; }` | The path of the loaded `hostfxr`, or `null` if it has not been loaded yet. |
+| `static void EnsureLoaded(HostFxrResolutionOptions? options = null)` | Locates and loads `hostfxr` if not already loaded. Idempotent and process-wide; only the first call's options take effect. |
+| `static void LoadFrom(string hostFxrPath)` | Loads `hostfxr` from an explicit path, bypassing `nethost` discovery entirely. Idempotent and process-wide. Throws `ArgumentException` for a null/empty path or `HostFxrResolutionException` if the library cannot be loaded. |
+| `static HostContext InitializeForCommandLine(string[] args, HostContextOptions? options = null)` | Initializes the first context for running a managed application (`hostfxr_initialize_for_dotnet_command_line`). Can only succeed once per process. Throws `RuntimeAlreadyLoadedException` if a runtime is already loaded. |
+| `static HostContext InitializeForRuntimeConfig(string runtimeConfigPath, HostContextOptions? options = null)` | Initializes a context from a `.runtimeconfig.json` (`hostfxr_initialize_for_runtime_config`). May be called multiple times and is safe to call concurrently. |
+| `static bool TryGetActiveRuntimeProperty(string name, out string? value)` | Reads a single runtime property from the process's first (active) context. Returns `false` if the property does not exist. |
+| `static IReadOnlyDictionary<string, string> GetActiveRuntimeProperties()` | Reads all runtime properties from the process's first (active) context as a snapshot. |
+| `static IDisposable SetErrorWriter(HostErrorWriter writer)` | Installs a process-wide diagnostic error writer. Dispose the returned registration to remove it. The native writer is process-global, so the most recent registration wins. |
+
+The callback type:
+
+```csharp
+// Receives diagnostic messages emitted by the hosting components.
+public delegate void HostErrorWriter(string message);
+```
+
+```csharp
+using HostFxrSharp;
+
+// Optional: control discovery explicitly. Initialize* would otherwise load hostfxr on demand.
+HostFxr.EnsureLoaded();
+Console.WriteLine(HostFxr.LoadedHostFxrPath);
+
+// Capture host diagnostics for the lifetime of the registration.
+using IDisposable diagnostics = HostFxr.SetErrorWriter(message => Console.Error.WriteLine(message));
+
+// Run a managed application and return its exit code.
+using var app = HostFxr.InitializeForCommandLine(["MyApp.dll", "--verbose"]);
+int exitCode = app.RunApp();
+```
+
+<Callout type="info">
+  **Loading from an explicit path.** `HostFxr.LoadFrom` lets you skip `nethost` entirely — useful for
+  an app-local, self-contained `hostfxr` where no `nethost` library ships. Because a process loads a
+  single `hostfxr`, only the first `LoadFrom`/`EnsureLoaded` call takes effect. See
+  [Locating hostfxr](/docs/guide/locating-hostfxr).
+</Callout>
+
+## Contexts
+
+An initialized [`HostContext`](#hostcontext) is the safe, disposable owner of a native
+`hostfxr_handle`: the runtime is started through it, runtime properties are inspected and modified on
+it, and runtime delegates are obtained from it.
+
+| Type | Namespace | Summary |
+| --- | --- | --- |
+| [`HostContext`](#hostcontext) | `HostFxrSharp.Contexts` | Disposable owner of a native host context; starts the runtime and yields runtime delegates. |
+| [`RuntimeProperties`](#runtimeproperties) | `HostFxrSharp.Contexts` | Typed accessor for a context's runtime properties. |
+| [`HostContextKind`](#hostcontextkind) | `HostFxrSharp.Contexts` | Whether a context is the process's first (runtime-owning) context or a secondary one. |
+| [`RuntimePropertyConflict`](#runtimepropertyconflict) | `HostFxrSharp.Contexts` | A property whose requested value differs from the running runtime's value. |
+| [`HostContextOptions`](#hostcontextoptions) | `HostFxrSharp.Contexts` | Options common to all initialization calls. |
+| [`HostFxrResolutionOptions`](#hostfxrresolutionoptions) | `HostFxrSharp.Resolution` | Options controlling how `nethost` locates `hostfxr`. |
+
+### HostContext
+
+`public sealed class HostContext : IDisposable` — full guide at
+[Host contexts](/docs/guide/host-contexts).
+
+<Callout type="warn">
+  **Threading and lifetime.** A `HostContext` is **not thread-safe**: call at most one method at a
+  time from a single thread (different contexts may be used from different threads). Always
+  `Dispose` a context; the underlying handle is a `SafeHandle`, so `hostfxr_close` runs exactly once,
+  but an abandoned first context can block future initializations at the native layer.
+</Callout>
+
+<Callout type="info">
+  **Runtime start.** Requesting any runtime delegate (or calling `RunApp`) starts the runtime; after
+  that, runtime properties become read-only.
+</Callout>
+
+**Properties**
+
+| Member | Summary |
+| --- | --- |
+| `HostContextKind Kind { get; }` | Whether this is the process's first (runtime-owning) context or a secondary one. |
+| `bool RuntimePropertiesDiffer { get; }` | `true` for a secondary context whose configuration specifies properties differing from the running runtime (native `Success_DifferentRuntimeProperties`). The differing values are ignored by the running runtime. |
+| `HostStatusCode InitializationStatus { get; }` | The status code returned by the initialization call that created this context. |
+| `RuntimeProperties Properties { get; }` | The runtime property accessor for this context. |
+| `bool IsDisposed { get; }` | Whether this context has been disposed. |
+
+**Methods**
+
+| Member | Summary |
+| --- | --- |
+| `int RunApp()` | Runs the application supplied to `InitializeForCommandLine`, blocking until it exits, and returns its exit code. Callable at most once, and only on a command-line context; otherwise throws `InvalidOperationException`. Throws `ObjectDisposedException` if disposed. |
+| `nint GetRuntimeDelegate(HostFxrDelegateType type)` | Starts the runtime (if not already) and returns a raw native function pointer for the requested delegate type. Throws `UnsupportedHostingScenarioException` for a delegate unavailable on the current runtime (e.g. WinRT activation on .NET 5+). |
+| `AssemblyFunctionPointerLoader GetAssemblyFunctionPointerLoader()` | Typed wrapper for `load_assembly_and_get_function_pointer` (isolated ALC load + static-method pointer). |
+| `FunctionPointerResolver GetFunctionPointerResolver()` | Typed wrapper for `get_function_pointer` (default-ALC method pointer, .NET 5+). |
+| `AssemblyLoader GetAssemblyLoader()` | Typed wrapper for `load_assembly` (default-ALC load by path, .NET 8+). |
+| `AssemblyBytesLoader GetAssemblyBytesLoader()` | Typed wrapper for `load_assembly_bytes` (default-ALC load from memory, .NET 8+). |
+| `IReadOnlyList<RuntimePropertyConflict> GetConflictingRuntimeProperties()` | For a secondary context with `RuntimePropertiesDiffer`, the properties whose requested value differs from (or is missing on) the running runtime. Empty otherwise. |
+| `void Dispose()` | Closes the native handle (`hostfxr_close`). Safe to call more than once. |
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Contexts;
+
+// A .runtimeconfig.json component. May attach as a secondary context if a runtime is already running.
+using var context = HostFxr.InitializeForRuntimeConfig("MyComponent.runtimeconfig.json");
+
+if (context.Kind is HostContextKind.Secondary && context.RuntimePropertiesDiffer)
+{
+    foreach (RuntimePropertyConflict conflict in context.GetConflictingRuntimeProperties())
+        Console.WriteLine($"{conflict.Name}: requested '{conflict.RequestedValue}', active '{conflict.ActiveValue}'");
+}
+
+// Obtaining any loader starts the runtime; after this, properties are read-only.
+var loader = context.GetAssemblyFunctionPointerLoader();
+```
+
+See [Running applications](/docs/guide/running-apps) for `RunApp`, and
+[Loading assemblies](/docs/guide/loading-assemblies) for the four typed loaders.
+
+### RuntimeProperties
+
+`public sealed class RuntimeProperties` — typed accessor for a context's runtime properties, reachable
+via `HostContext.Properties`. Full guide at [Runtime properties](/docs/guide/runtime-properties).
+
+Reads are always allowed (until disposal). Modification is only legal on the
+[`First`](#hostcontextkind) context and only before the runtime has started; otherwise
+`Set` throws `InvalidOperationException`.
+
+| Member | Summary |
+| --- | --- |
+| `bool CanModify { get; }` | Whether properties can currently be modified (first context, not disposed, runtime not started). |
+| `string this[string name] { get; }` | The value of a property. Throws `RuntimePropertyNotFoundException` if it does not exist, or `ObjectDisposedException` if the context is disposed. |
+| `bool TryGetValue(string name, out string? value)` | Attempts to read a property; returns `false` (with `value` null) if it does not exist. |
+| `void Set(string name, string? value)` | Sets a property, or removes it when `value` is `null`. Throws `InvalidOperationException` if the context is secondary or the runtime has already started. |
+| `IReadOnlyDictionary<string, string> GetAll()` | All runtime properties for this context as an immutable snapshot (ordinal key comparison). |
+
+```csharp
+using HostFxrSharp;
+
+using var context = HostFxr.InitializeForRuntimeConfig("MyComponent.runtimeconfig.json");
+var properties = context.Properties;
+
+// Read.
+if (properties.TryGetValue("System.GC.Server", out string? gcMode))
+    Console.WriteLine($"Server GC: {gcMode}");
+
+// Write — only before the runtime starts, and only on the first context.
+if (properties.CanModify)
+    properties.Set("System.GC.Server", "true");
+
+foreach (KeyValuePair<string, string> kv in properties.GetAll())
+    Console.WriteLine($"{kv.Key} = {kv.Value}");
+```
+
+### HostContextKind
+
+`public enum HostContextKind` — identifies a context's role. Only one runtime can be loaded per
+process; the first initialized context owns it, and any subsequent context attaches to it.
+
+| Value | Summary |
+| --- | --- |
+| `First` | The first host context in the process; it loads and owns the runtime. |
+| `Secondary` | A secondary context that attached to the already-loaded runtime. |
+
+### RuntimePropertyConflict
+
+`public readonly record struct RuntimePropertyConflict(string Name, string RequestedValue, string? ActiveValue)` —
+describes a runtime property whose requested value differs from the value already set on the running
+runtime.
+
+| Member | Summary |
+| --- | --- |
+| `string Name` | The runtime property name. |
+| `string RequestedValue` | The value requested by the secondary context's configuration. |
+| `string? ActiveValue` | The value currently set on the running runtime, or `null` if the property is not set there. |
+
+### HostContextOptions
+
+`public sealed class HostContextOptions` — options common to all host-context initialization calls.
+All properties are `init`-only.
+
+| Member | Summary |
+| --- | --- |
+| `string? HostPath { get; init; }` | Optional path to the native host (typically the `.exe`), passed to CoreCLR as the executable path. Need not be an executable file (e.g. a `comhost.dll` path in COM activation). |
+| `string? DotNetRoot { get; init; }` | Optional path to the root of the .NET installation in use. If unset, `hostfxr` auto-detects it from its own location. |
+| `HostFxrResolutionOptions? Resolution { get; init; }` | Optional resolution options used only when this library needs to locate/load `hostfxr` first. |
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Contexts;
+using HostFxrSharp.Resolution;
+
+var options = new HostContextOptions
+{
+    DotNetRoot = @"C:\Program Files\dotnet",
+    Resolution = new HostFxrResolutionOptions { DotNetRoot = @"C:\Program Files\dotnet" }
+};
+
+using var context = HostFxr.InitializeForRuntimeConfig("MyComponent.runtimeconfig.json", options);
+```
+
+### HostFxrResolutionOptions
+
+`public sealed class HostFxrResolutionOptions` (namespace `HostFxrSharp.Resolution`) — controls how
+`nethost` locates `hostfxr`. All properties are `init`-only.
+
+| Member | Summary |
+| --- | --- |
+| `string? AssemblyPath { get; init; }` | Optional path to the component's assembly. When set (and `DotNetRoot` is not), `hostfxr` is located as if `AssemblyPath` were an `apphost`. |
+| `string? DotNetRoot { get; init; }` | Optional path to the root of a .NET installation. When set, it takes precedence and `AssemblyPath` is ignored — `hostfxr` is located as if starting `dotnet app.dll`. |
+
+<Callout type="info">
+  **Precedence.** If both are `null`, `hostfxr` is located via the environment variable or global
+  registration. If `DotNetRoot` is set it wins and `AssemblyPath` is ignored, matching native
+  semantics.
+</Callout>
+
+## Loading
+
+The four data-loading runtime delegates are exposed as small, `readonly struct` wrappers around raw
+native function pointers — **no managed delegate marshalling**, so they are fully Native-AOT
+compatible. Obtain them from a started [`HostContext`](#hostcontext). Each wrapper implements
+`IEquatable<T>` and `== / !=` (comparing the underlying pointer), and exposes `IsValid` and
+`UnderlyingPointer`. Full guide at [Loading assemblies](/docs/guide/loading-assemblies).
+
+| Type | Native helper | Load context | Availability |
+| --- | --- | --- | --- |
+| [`AssemblyFunctionPointerLoader`](#assemblyfunctionpointerloader) | `load_assembly_and_get_function_pointer` | Isolated ALC (`.deps.json` resolved) | .NET Core 3.0+ |
+| [`FunctionPointerResolver`](#functionpointerresolver) | `get_function_pointer` | Default ALC | .NET 5+ |
+| [`AssemblyLoader`](#assemblyloader) | `load_assembly` | Default ALC (`.deps.json` resolved) | .NET 8+ |
+| [`AssemblyBytesLoader`](#assemblybytesloader) | `load_assembly_bytes` | Default ALC (no file-based resolution) | .NET 8+ |
+| [`MethodSignature`](#methodsignature) | — | Describes the target method's signature | — |
+| [`HostFxrDelegateType`](#hostfxrdelegatetype) | — | The native `hostfxr_delegate_type` enum | — |
+
+### AssemblyFunctionPointerLoader
+
+`public readonly struct AssemblyFunctionPointerLoader` — wraps `load_assembly_and_get_function_pointer`.
+The target assembly is always loaded into an **isolated** `AssemblyLoadContext` with
+`AssemblyDependencyResolver` applied from its `.deps.json`. The returned pointer has process lifetime;
+the loaded component cannot be unloaded.
+
+| Member | Summary |
+| --- | --- |
+| `bool IsValid { get; }` | Whether this wrapper holds a valid function pointer. |
+| `nint UnderlyingPointer { get; }` | The underlying native function pointer. |
+| `nint Load(string assemblyPath, string typeName, string methodName, MethodSignature signature = default)` | Loads the assembly in isolation and returns a native pointer to the specified `static` method. `signature` defaults to `MethodSignature.Default`. Throws `ArgumentException` for a null/empty string argument, or `InvalidOperationException` if the wrapper was not obtained from a host context. |
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Loading;
+
+using var context = HostFxr.InitializeForRuntimeConfig("MyComponent.runtimeconfig.json");
+var loader = context.GetAssemblyFunctionPointerLoader();
+
+// Resolve a [UnmanagedCallersOnly] static int Add(int, int).
+nint fn = loader.Load(
+    assemblyPath: "MyComponent.dll",
+    typeName: "MyComponent.Exports, MyComponent",
+    methodName: "Add",
+    signature: MethodSignature.UnmanagedCallersOnly);
+
+unsafe
+{
+    var add = (delegate* unmanaged<int, int, int>)fn;
+    int sum = add(2, 3); // 5
+}
+```
+
+### FunctionPointerResolver
+
+`public readonly struct FunctionPointerResolver` — wraps `get_function_pointer` (.NET 5+). Resolves a
+type/method from the **default** `AssemblyLoadContext` (the assembly must already be available there)
+and returns a native function pointer.
+
+| Member | Summary |
+| --- | --- |
+| `bool IsValid { get; }` | Whether this wrapper holds a valid function pointer. |
+| `nint UnderlyingPointer { get; }` | The underlying native function pointer. |
+| `nint Resolve(string typeName, string methodName, MethodSignature signature = default)` | Resolves a `static` method in the default load context and returns a native pointer to it. |
+
+```csharp
+using HostFxrSharp.Loading;
+
+var resolver = context.GetFunctionPointerResolver();
+
+nint fn = resolver.Resolve(
+    typeName: "MyComponent.Exports, MyComponent",
+    methodName: "Add",
+    signature: MethodSignature.UnmanagedCallersOnly);
+```
+
+### AssemblyLoader
+
+`public readonly struct AssemblyLoader` — wraps `load_assembly` (.NET 8+). Loads an assembly **by
+path** into the default load context, registering `AssemblyDependencyResolver` from the sibling
+`.deps.json`. Matches `AssemblyLoadContext.LoadFromAssemblyPath` semantics.
+
+| Member | Summary |
+| --- | --- |
+| `bool IsValid { get; }` | Whether this wrapper holds a valid function pointer. |
+| `nint UnderlyingPointer { get; }` | The underlying native function pointer. |
+| `void Load(string assemblyPath)` | Loads the assembly at the specified path into the default load context. |
+
+```csharp
+using HostFxrSharp.Loading;
+
+var loader = context.GetAssemblyLoader();
+loader.Load("Plugin.dll");
+```
+
+### AssemblyBytesLoader
+
+`public readonly struct AssemblyBytesLoader` — wraps `load_assembly_bytes` (.NET 8+). Loads an
+assembly from a byte array into the default load context. Provides **no** file-based dependency
+resolution — dependencies must be pre-loaded or resolved by the assembly itself.
+
+| Member | Summary |
+| --- | --- |
+| `bool IsValid { get; }` | Whether this wrapper holds a valid function pointer. |
+| `nint UnderlyingPointer { get; }` | The underlying native function pointer. |
+| `void Load(ReadOnlySpan<byte> assembly, ReadOnlySpan<byte> symbols = default)` | Loads an assembly (and optional PDB symbols) from memory. Throws `ArgumentException` if `assembly` is empty. |
+
+```csharp
+using HostFxrSharp.Loading;
+
+var loader = context.GetAssemblyBytesLoader();
+byte[] assemblyBytes = File.ReadAllBytes("Plugin.dll");
+loader.Load(assemblyBytes);
+```
+
+### MethodSignature
+
+`public readonly struct MethodSignature` — describes the signature of a managed method targeted by
+`load_assembly_and_get_function_pointer` or `get_function_pointer`, hiding the native
+`delegate_type_name` string and the `UNMANAGEDCALLERSONLY_METHOD` sentinel. `default(MethodSignature)`
+equals `Default`. Implements `IEquatable<MethodSignature>` with `== / !=`.
+
+| Member | Summary |
+| --- | --- |
+| `static MethodSignature Default { get; }` | The default component entry-point signature (`delegate_type_name == NULL`): `int (nint arg, int argSizeInBytes)`. |
+| `static MethodSignature UnmanagedCallersOnly { get; }` | The target method carries `[UnmanagedCallersOnly]` (.NET 5+). |
+| `static MethodSignature FromDelegateType(string assemblyQualifiedDelegateTypeName)` | A signature given by an assembly-qualified delegate type name. Throws `ArgumentException` for a null/empty name. |
+| `MethodSignatureKind Kind { get; }` | The kind of signature description. |
+| `string? DelegateTypeName { get; }` | The delegate type name for `DelegateType`; otherwise `null`. |
+
+The companion enum `MethodSignatureKind` names the three shapes:
+
+| Value | Summary |
+| --- | --- |
+| `ComponentEntryPoint` | Default shape `int (nint args, int sizeBytes)` mapping to native `int(void*, int32_t)`. |
+| `UnmanagedCallersOnly` | The method is marked `[UnmanagedCallersOnly]` (native `UNMANAGEDCALLERSONLY_METHOD` sentinel, .NET 5+). |
+| `DelegateType` | The signature is given by an assembly-qualified delegate type name. |
+
+```csharp
+using HostFxrSharp.Loading;
+
+MethodSignature entryPoint = MethodSignature.Default;              // int (nint arg, int argSizeInBytes)
+MethodSignature unmanaged  = MethodSignature.UnmanagedCallersOnly; // [UnmanagedCallersOnly] target
+MethodSignature typed      = MethodSignature.FromDelegateType("MyComponent.ComputeDelegate, MyComponent");
+```
+
+### HostFxrDelegateType
+
+`public enum HostFxrDelegateType` — the values of the native `enum hostfxr_delegate_type` from
+`hostfxr.h`, used with [`HostContext.GetRuntimeDelegate`](#hostcontext). The numeric values match the
+native header exactly and must not be reordered. Prefer the typed wrappers above for the four
+data-loading delegates; use `GetRuntimeDelegate` directly for the COM/WinRT/IJW scenarios.
+
+| Value | Native name | Availability |
+| --- | --- | --- |
+| `ComActivation` (0) | `hdt_com_activation` | .NET Core 3.0+ |
+| `LoadInMemoryAssembly` (1) | `hdt_load_in_memory_assembly` (IJW) | .NET Core 3.0+ |
+| `WinRtActivation` (2) | `hdt_winrt_activation` | **.NET Core 3.x only** — removed in .NET 5+ |
+| `ComRegister` (3) | `hdt_com_register` | .NET Core 3.0+ |
+| `ComUnregister` (4) | `hdt_com_unregister` | .NET Core 3.0+ |
+| `LoadAssemblyAndGetFunctionPointer` (5) | `hdt_load_assembly_and_get_function_pointer` | .NET Core 3.0+ |
+| `GetFunctionPointer` (6) | `hdt_get_function_pointer` | .NET 5+ |
+| `LoadAssembly` (7) | `hdt_load_assembly` | .NET 8+ |
+| `LoadAssemblyBytes` (8) | `hdt_load_assembly_bytes` | .NET 8+ |
+
+<Callout type="warn">
+  **Removed delegates throw.** Requesting `WinRtActivation` on .NET 5 or later throws
+  `UnsupportedHostingScenarioException`.
+</Callout>
+
+## Diagnostics
+
+The happy-path API never surfaces a raw status code — failures arrive as
+[typed exceptions](#exception-hierarchy). The [`HostStatusCode`](#hoststatuscode) enum is exposed for
+diagnostics (for example via `HostingException.StatusCode`) so callers can make structured decisions.
+Full guide at [Error handling](/docs/guide/error-handling).
+
+### HostStatusCode
+
+`public enum HostStatusCode` — mirrors `enum StatusCode` in the runtime's `error_codes.h`. The values
+`0`, `1`, `2` are successes (where `SuccessDifferentRuntimeProperties` is a non-fatal warning); the
+high-bit `0x8xxxxxxx` values are failures.
+
+| Value | Raw | Summary |
+| --- | --- | --- |
+| `Success` | `0` | Operation succeeded. |
+| `SuccessHostAlreadyInitialized` | `1` | Attached to an already-initialized runtime — a *secondary* context. |
+| `SuccessDifferentRuntimeProperties` | `2` | Secondary context whose config specifies differing properties (warning; differing values are ignored). |
+| `InvalidArgFailure` | `0x80008081` | Invalid argument. |
+| `CoreHostLibLoadFailure` | `0x80008082` | A hosting library failed to load. |
+| `CoreHostLibMissingFailure` | `0x80008083` | A hosting library could not be found. |
+| `CoreHostEntryPointFailure` | `0x80008084` | A hosting entry point failed. |
+| `CurrentHostFindFailure` | `0x80008085` | The current host could not be located. |
+| `CoreClrResolveFailure` | `0x80008087` | CoreCLR could not be resolved. |
+| `CoreClrBindFailure` | `0x80008088` | CoreCLR could not be bound. |
+| `CoreClrInitFailure` | `0x80008089` | CoreCLR failed to initialize. |
+| `CoreClrExeFailure` | `0x8000808a` | CoreCLR execution failed. |
+| `ResolverInitFailure` | `0x8000808b` | The dependency resolver failed to initialize. |
+| `ResolverResolveFailure` | `0x8000808c` | The dependency resolver failed to resolve. |
+| `LibHostInitFailure` | `0x8000808e` | The host library failed to initialize. |
+| `LibHostInvalidArgs` | `0x80008092` | Invalid arguments to the host library. |
+| `InvalidConfigFile` | `0x80008093` | The `.runtimeconfig.json` is invalid. |
+| `AppArgNotRunnable` | `0x80008094` | The application argument is not runnable. |
+| `AppHostExeNotBoundFailure` | `0x80008095` | The apphost executable is not bound. |
+| `FrameworkMissingFailure` | `0x80008096` | A required shared framework is missing. |
+| `HostApiFailed` | `0x80008097` | A host API call failed. |
+| `HostApiBufferTooSmall` | `0x80008098` | The supplied buffer was too small (handled transparently by this library). |
+| `AppPathFindFailure` | `0x8000809a` | The application path could not be found. |
+| `SdkResolveFailure` | `0x8000809b` | The SDK could not be resolved. |
+| `FrameworkCompatFailure` | `0x8000809c` | Framework compatibility failure. |
+| `FrameworkCompatRetry` | `0x8000809d` | Framework compatibility retry. |
+| `BundleExtractionFailure` | `0x8000809f` | Single-file bundle extraction failed. |
+| `BundleExtractionIoError` | `0x800080a0` | Single-file bundle extraction I/O error. |
+| `LibHostDuplicateProperty` | `0x800080a1` | A duplicate runtime property was supplied. |
+| `HostApiUnsupportedVersion` | `0x800080a2` | A new `hostfxr` API was invoked against an older `hostpolicy`. |
+| `HostInvalidState` | `0x800080a3` | The operation is invalid in the current host state. |
+| `HostPropertyNotFound` | `0x800080a4` | A requested runtime property does not exist. |
+| `HostIncompatibleConfig` | `0x800080a5` | Incompatible host configuration. |
+| `HostApiUnsupportedScenario` | `0x800080a6` | The requested scenario is not supported for this host context. |
+| `HostFeatureDisabled` | `0x800080a7` | The requested host feature is disabled. |
+
+### HostingStatusCodeExtensions
+
+`public static class HostingStatusCodeExtensions` — convenience classification helpers on
+`HostStatusCode`.
+
+| Member | Summary |
+| --- | --- |
+| `bool IsSuccess()` | `true` when the code is a success or warning code (`>= 0`). |
+| `bool IsFailure()` | `true` when the code is a failure code (`< 0`). |
+| `bool IsSecondaryContext()` | `true` for `SuccessHostAlreadyInitialized` or `SuccessDifferentRuntimeProperties`. |
+
+```csharp
+using HostFxrSharp;
+
+HostStatusCode code = context.InitializationStatus;
+
+if (code.IsSuccess() && code.IsSecondaryContext())
+    Console.WriteLine("Attached to an already-running runtime.");
+```
+
+### Exception hierarchy
+
+Every failure this library raises derives from the abstract `HostingException` (namespace
+`HostFxrSharp.Exceptions`), so a single `catch (HostingException)` covers them all. When a failure
+originates from a native call, the originating status code is preserved on
+`HostingException.StatusCode` (a `HostStatusCode?`).
+
+```text
+Exception
+└─ HostingException (abstract)          — StatusCode { get; }
+   ├─ HostFxrNotFoundException          — hostfxr could not be located
+   ├─ HostFxrResolutionException        — nethost failed to resolve hostfxr (other reason)
+   └─ HostingApiException               — a general native hosting failure
+      ├─ HostInvalidStateException      — invalid host state
+      ├─ IncompatibleHostPolicyException — new hostfxr API vs. older hostpolicy
+      ├─ RuntimeAlreadyLoadedException  — a runtime is already loaded in this process
+      ├─ RuntimePropertyNotFoundException — a requested runtime property is missing
+      └─ UnsupportedHostingScenarioException — the scenario is unsupported for the context
+```
+
+| Type | Base | Summary |
+| --- | --- | --- |
+| `HostingException` | `Exception` | Abstract base for all library exceptions. Exposes `HostStatusCode? StatusCode`. |
+| `HostFxrNotFoundException` | `HostingException` | `hostfxr` could not be located by `nethost`. |
+| `HostFxrResolutionException` | `HostingException` | `nethost` failed to resolve `hostfxr` for a non "not-found" reason. |
+| `HostingApiException` | `HostingException` | A general failure returned by a native hosting call, carrying its `HostStatusCode`. |
+| `HostInvalidStateException` | `HostingApiException` | A native call reported an invalid host state (`HostInvalidState`). |
+| `IncompatibleHostPolicyException` | `HostingApiException` | A new `hostfxr` API was invoked against an older `hostpolicy` (`HostApiUnsupportedVersion`). |
+| `RuntimeAlreadyLoadedException` | `HostingApiException` | An operation required that no runtime be loaded, but one already is. |
+| `RuntimePropertyNotFoundException` | `HostingApiException` | A requested runtime property does not exist. Adds `string? PropertyName { get; init; }` and the factory `static ForProperty(string)`. |
+| `UnsupportedHostingScenarioException` | `HostingApiException` | The requested scenario is not supported for the given host context (`HostApiUnsupportedScenario`). |
+
+Selected status codes map to specific subtypes:
+
+| Status code | Exception |
+| --- | --- |
+| `HostApiUnsupportedVersion` | `IncompatibleHostPolicyException` |
+| `HostApiUnsupportedScenario` | `UnsupportedHostingScenarioException` |
+| `HostPropertyNotFound` | `RuntimePropertyNotFoundException` |
+| `CoreHostLibMissingFailure` | `HostFxrNotFoundException` |
+| `HostInvalidState` (command-line init) | `RuntimeAlreadyLoadedException` |
+| `HostInvalidState` (other) | `HostInvalidStateException` |
+| *(any other failure)* | `HostingApiException` |
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Exceptions;
+
+try
+{
+    using var app = HostFxr.InitializeForCommandLine(["MyApp.dll"]);
+    return app.RunApp();
+}
+catch (RuntimeAlreadyLoadedException ex)
+{
+    // Only one runtime can be loaded per process.
+    Console.Error.WriteLine($"{ex.Message} (status: {ex.StatusCode})");
+    return 1;
+}
+catch (HostingException ex)
+{
+    // Base type for every failure this library raises.
+    Console.Error.WriteLine(ex.Message);
+    return 1;
+}
+```
+
+## See also
+
+<Cards>
+  <Card title="Getting started" href="/docs/getting-started" description="A complete, runnable walkthrough." />
+  <Card title="How hosting works" href="/docs/concepts" description="The mental model behind nethost, hostfxr, and host contexts." />
+  <Card title="Locating hostfxr" href="/docs/guide/locating-hostfxr" description="How nethost finds hostfxr and when to supply resolution options." />
+  <Card title="Host contexts" href="/docs/guide/host-contexts" description="Initializing, disposing, and reasoning about first vs. secondary contexts." />
+  <Card title="Runtime properties" href="/docs/guide/runtime-properties" description="Reading and modifying runtime properties before the runtime starts." />
+  <Card title="Running applications" href="/docs/guide/running-apps" description="Using RunApp to launch a managed application." />
+  <Card title="Loading assemblies" href="/docs/guide/loading-assemblies" description="The four typed loaders and their load contexts." />
+  <Card title="Error handling" href="/docs/guide/error-handling" description="The exception hierarchy and status-code mapping." />
+  <Card title="Cross-platform" href="/docs/cross-platform" description="char_t marshalling and per-platform behavior." />
+  <Card title="Native AOT" href="/docs/native-aot" description="Why the whole surface is AOT-friendly." />
+</Cards>

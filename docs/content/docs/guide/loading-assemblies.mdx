@@ -1,0 +1,424 @@
+---
+title: Loading assemblies
+description: Load assemblies and resolve native function pointers to managed static methods.
+---
+
+Once you have an initialized [`HostContext`](/docs/guide/host-contexts), you can start the .NET runtime
+and hand it managed code to load — resolving native function pointers to `static` methods, or loading
+assemblies by path or from memory. HostFxrSharp exposes the four data-loading runtime delegates of
+`hostfxr` as small, strongly-typed wrappers, so you never touch the raw native signatures, the
+`char_t` marshalling, or the `UNMANAGEDCALLERSONLY_METHOD` sentinel yourself.
+
+This is the counterpart to [Running applications](/docs/guide/running-apps): instead of running an
+`app.dll` to completion, you load a *component* (typically a framework-dependent class library with a
+`.runtimeconfig.json`) and call into it. See [How hosting works](/docs/concepts) for the underlying model.
+
+<Callout type="warn">
+  **Requesting any loader starts the runtime.** All four wrappers are obtained by asking the context
+  for a runtime delegate, which starts the runtime the first time. After that, [runtime
+  properties](/docs/guide/runtime-properties) become read-only. Set every property you need **before**
+  calling any `Get…Loader` / `GetFunctionPointerResolver` method.
+</Callout>
+
+## The four loaders at a glance
+
+Each accessor on `HostContext` returns a `readonly struct` wrapper (in `HostFxrSharp.Loading`) over one
+native runtime delegate:
+
+| Accessor | Native helper | Load context | Dependency resolution | Result | Minimum runtime |
+| --- | --- | --- | --- | --- | --- |
+| `GetAssemblyFunctionPointerLoader()` | `load_assembly_and_get_function_pointer` | **Isolated** `AssemblyLoadContext` | `.deps.json` via `AssemblyDependencyResolver` | `nint` function pointer | .NET Core 3.0+ |
+| `GetFunctionPointerResolver()` | `get_function_pointer` | **Default** `AssemblyLoadContext` | none (assembly must already be loaded) | `nint` function pointer | .NET 5+ |
+| `GetAssemblyLoader()` | `load_assembly` | **Default** `AssemblyLoadContext` | `.deps.json` via `AssemblyDependencyResolver` | *void* (loads only) | .NET 8+ |
+| `GetAssemblyBytesLoader()` | `load_assembly_bytes` | **Default** `AssemblyLoadContext` | none (dependencies must be pre-loaded) | *void* (loads only) | .NET 8+ |
+
+Every wrapper exposes `IsValid` and `UnderlyingPointer` and has value equality. A default-constructed
+wrapper (one not obtained from a context) has `IsValid == false`; calling its `Load` / `Resolve` throws
+`InvalidOperationException`.
+
+<Callout type="info">
+  **The loaders are just typed views over `GetRuntimeDelegate`.** `GetAssemblyFunctionPointerLoader()`
+  is exactly `new AssemblyFunctionPointerLoader(GetRuntimeDelegate(HostFxrDelegateType.LoadAssemblyAndGetFunctionPointer))`.
+  If a delegate type is unavailable on the current runtime (for example requesting `load_assembly` on
+  .NET 6), the native call fails and surfaces as a `HostingException` — see
+  [Error handling](/docs/guide/error-handling). The `HostFxrDelegateType` enum lists availability per version.
+</Callout>
+
+## Isolated vs. default load context
+
+The single most important distinction between the loaders is *which* `AssemblyLoadContext` (ALC) the
+managed code ends up in. There is still only **one runtime per process**; isolation happens at the ALC
+level, not the runtime level.
+
+- **Isolated load context** — `GetAssemblyFunctionPointerLoader()` loads the target assembly into a
+  fresh, isolated `AssemblyLoadContext` with an `AssemblyDependencyResolver` built from the sibling
+  `.deps.json`. Each call resolves the component and its private dependencies independently, so two
+  components that reference different versions of the same library do not collide. This mirrors the
+  classic .NET Core 3.0 "component activation" model.
+
+- **Default load context** — `GetFunctionPointerResolver()`, `GetAssemblyLoader()`, and
+  `GetAssemblyBytesLoader()` all operate on the process's **default** ALC. Assemblies loaded here share
+  one resolution scope (the app's own dependency graph). `load_assembly` still applies the component's
+  `.deps.json`; `get_function_pointer` and `load_assembly_bytes` do **not** resolve dependencies for
+  you — the type must already be loadable in the default context.
+
+<Callout type="warn">
+  **The pointer has process lifetime.** A function pointer returned by any loader is valid for the life
+  of the process, and the assembly it came from **cannot be unloaded**. Resolve each entry point once
+  and cache the pointer; do not re-resolve on a hot path.
+</Callout>
+
+## Describing the method signature
+
+`GetAssemblyFunctionPointerLoader().Load(…)` and `GetFunctionPointerResolver().Resolve(…)` both take a
+`MethodSignature` (default `MethodSignature.Default`). It tells the runtime how to interpret the target
+`static` method and controls the native `delegate_type_name` argument. There are three kinds.
+
+| `MethodSignature` | `MethodSignatureKind` | Native `delegate_type_name` | Target method shape |
+| --- | --- | --- | --- |
+| `MethodSignature.Default` | `ComponentEntryPoint` | `NULL` | `static int M(IntPtr arg, int argSizeInBytes)` |
+| `MethodSignature.UnmanagedCallersOnly` | `UnmanagedCallersOnly` | `UNMANAGEDCALLERSONLY_METHOD` sentinel | a `[UnmanagedCallersOnly]` `static` method (.NET 5+) |
+| `MethodSignature.FromDelegateType(name)` | `DelegateType` | assembly-qualified delegate type name | a `static` method matching that delegate's signature |
+
+`default(MethodSignature)` equals `MethodSignature.Default`. The library never exposes the raw
+`((const char_t*)-1)` sentinel — select `MethodSignature.UnmanagedCallersOnly` instead.
+
+### Default — the component entry point
+
+Passing no signature (or `MethodSignature.Default`) targets the classic *component entry point*, whose
+shape is fixed as `int Method(IntPtr arg, int argSizeInBytes)`. The runtime returns a pointer that is
+invoked through a managed delegate:
+
+```csharp
+// In the component assembly (Plugin.dll):
+namespace Plugin;
+
+public static class Entry
+{
+    // Matches component_entry_point_fn: int(IntPtr, int).
+    public static int Run(IntPtr arg, int argSizeInBytes) => 0;
+}
+```
+
+```csharp
+using System.Runtime.InteropServices;
+
+// A host-side delegate that matches the fixed component_entry_point_fn shape.
+internal delegate int ComponentEntryPoint(IntPtr arg, int argSizeInBytes);
+
+// signature omitted => MethodSignature.Default
+nint pointer = loader.Load(
+    @"C:\components\Plugin\Plugin.dll",
+    "Plugin.Entry, Plugin",
+    "Run");
+
+var run = Marshal.GetDelegateForFunctionPointer<ComponentEntryPoint>(pointer);
+int rc = run(IntPtr.Zero, 0);
+```
+
+### UnmanagedCallersOnly
+
+`MethodSignature.UnmanagedCallersOnly` (.NET 5+) targets a `static` method annotated with
+`[UnmanagedCallersOnly]`. This is the **preferred, Native-AOT-friendly** path: the returned pointer is
+a genuine unmanaged function pointer you can call directly through a `delegate* unmanaged<…>`, with no
+managed delegate marshalling. The method's parameter and return types must be blittable.
+
+```csharp
+// In the component assembly (Calculator.dll):
+using System.Runtime.InteropServices;
+
+namespace Calculator;
+
+public static class Exports
+{
+    [UnmanagedCallersOnly]
+    public static int Add(int a, int b) => a + b;
+}
+```
+
+```csharp
+nint pointer = loader.Load(
+    "Calculator.dll",
+    "Calculator.Exports, Calculator",
+    "Add",
+    MethodSignature.UnmanagedCallersOnly);
+
+var add = (delegate* unmanaged<int, int, int>)pointer;
+int sum = add(2, 3); // 5
+```
+
+<Callout type="info">
+  **Match the calling convention.** A plain `[UnmanagedCallersOnly]` method with no `CallConvs` uses
+  the platform default, which matches `delegate* unmanaged<…>`. If you specify calling conventions on
+  the attribute (for example `CallConvs = [typeof(CallConvCdecl)]`), cast to the matching
+  `delegate* unmanaged[Cdecl]<…>`.
+</Callout>
+
+### FromDelegateType
+
+`MethodSignature.FromDelegateType(assemblyQualifiedDelegateTypeName)` targets a `static` method whose
+signature matches a named delegate type defined **in the loaded component**. Use this when the method
+is not `[UnmanagedCallersOnly]` and does not fit the component-entry-point shape. The returned pointer
+is invoked through a managed delegate, so this path (like `Default`) involves marshalling.
+
+```csharp
+// In the component assembly (Calculator.dll):
+namespace Calculator;
+
+public delegate int MultiplyDelegate(int a, int b);
+
+public static class Exports
+{
+    public static int Multiply(int a, int b) => a * b;
+}
+```
+
+```csharp
+using System.Runtime.InteropServices;
+
+// A host-side delegate with a matching signature, used only for marshalling.
+internal delegate int MultiplyDelegate(int a, int b);
+
+nint pointer = loader.Load(
+    "Calculator.dll",
+    "Calculator.Exports, Calculator",
+    "Multiply",
+    MethodSignature.FromDelegateType("Calculator.MultiplyDelegate, Calculator"));
+
+var multiply = Marshal.GetDelegateForFunctionPointer<MultiplyDelegate>(pointer);
+int product = multiply(6, 7); // 42
+```
+
+<Callout type="info">
+  `MethodSignature.FromDelegateType(null)` or an empty string throws `ArgumentException`.
+</Callout>
+
+## Complete example: isolated load + `[UnmanagedCallersOnly]` call
+
+The following program initializes a host context from a component's `.runtimeconfig.json`, loads the
+component into an **isolated** load context, resolves a native pointer to an `[UnmanagedCallersOnly]`
+method, and calls it through a `delegate* unmanaged<…>` — the end-to-end, AOT-friendly path.
+
+<Steps>
+
+<Step>
+
+### Publish the component
+
+The component is its own project, published to `C:\components\Calculator`. It exposes a blittable
+`[UnmanagedCallersOnly]` static method:
+
+```csharp
+using System.Runtime.InteropServices;
+
+namespace Calculator;
+
+public static class Exports
+{
+    [UnmanagedCallersOnly]
+    public static int Add(int a, int b) => a + b;
+}
+```
+
+</Step>
+
+<Step>
+
+### Initialize a host context
+
+`HostFxr.InitializeForRuntimeConfig` creates the context from the component's `.runtimeconfig.json`. It
+starts nothing yet, so any [runtime properties](/docs/guide/runtime-properties) you need must be set now.
+
+</Step>
+
+<Step>
+
+### Request the loader (starts the runtime)
+
+`GetAssemblyFunctionPointerLoader()` obtains the `load_assembly_and_get_function_pointer` delegate,
+which starts the runtime. Runtime properties become read-only from this point.
+
+</Step>
+
+<Step>
+
+### Load and call
+
+`loader.Load(…)` isolated-loads the assembly and returns a native pointer to `Add`. Cast it to a
+`delegate* unmanaged<…>` and invoke it directly — no marshalling.
+
+</Step>
+
+</Steps>
+
+The host program. Unsafe function pointers require `<AllowUnsafeBlocks>true</AllowUnsafeBlocks>` in the
+host project:
+
+```csharp
+using System;
+using HostFxrSharp;
+using HostFxrSharp.Contexts;
+using HostFxrSharp.Exceptions;
+using HostFxrSharp.Loading;
+
+internal static class Program
+{
+    private static unsafe void Main()
+    {
+        try
+        {
+            // Initialize a host context for the component (starts nothing yet).
+            using HostContext host = HostFxr.InitializeForRuntimeConfig(
+                @"C:\components\Calculator\Calculator.runtimeconfig.json");
+
+            // Requesting the loader starts the runtime; properties are now read-only.
+            AssemblyFunctionPointerLoader loader = host.GetAssemblyFunctionPointerLoader();
+
+            // Isolated-load the assembly and resolve a pointer to Add.
+            nint pointer = loader.Load(
+                assemblyPath: @"C:\components\Calculator\Calculator.dll",
+                typeName:     "Calculator.Exports, Calculator",
+                methodName:   "Add",
+                signature:    MethodSignature.UnmanagedCallersOnly);
+
+            // Call directly through an unmanaged function pointer — no marshalling.
+            var add = (delegate* unmanaged<int, int, int>)pointer;
+            int sum = add(2, 3);
+
+            Console.WriteLine($"2 + 3 = {sum}"); // 2 + 3 = 5
+        }
+        catch (HostingException ex)
+        {
+            Console.Error.WriteLine($"Hosting failed: {ex.Message}");
+        }
+    }
+}
+```
+
+<Callout type="info">
+  **`InitializeForRuntimeConfig` may be called more than once.** Unlike command-line initialization,
+  it can create multiple (secondary) contexts and is safe to call concurrently — but all of them attach
+  to the *same* single runtime. See [Host contexts](/docs/guide/host-contexts).
+</Callout>
+
+## Loading into the default context: `AssemblyLoader` + `FunctionPointerResolver`
+
+`get_function_pointer` resolves a method that is already available in the **default** load context — it
+does not load anything. On .NET 8+, pair it with `load_assembly` to first bring the assembly into that
+context by path (which *does* apply the component's `.deps.json`):
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Contexts;
+using HostFxrSharp.Loading;
+
+unsafe void CallInDefaultContext()
+{
+    using HostContext host = HostFxr.InitializeForRuntimeConfig(
+        @"C:\components\Calculator\Calculator.runtimeconfig.json");
+
+    // .NET 8+: load the assembly (and its dependencies) into the default ALC.
+    AssemblyLoader assemblies = host.GetAssemblyLoader();
+    assemblies.Load(@"C:\components\Calculator\Calculator.dll");
+
+    // .NET 5+: resolve a method now present in the default ALC.
+    FunctionPointerResolver resolver = host.GetFunctionPointerResolver();
+    nint pointer = resolver.Resolve(
+        "Calculator.Exports, Calculator",
+        "Add",
+        MethodSignature.UnmanagedCallersOnly);
+
+    var add = (delegate* unmanaged<int, int, int>)pointer;
+    int sum = add(10, 20); // 30
+}
+```
+
+`AssemblyLoader.Load` returns nothing — it only makes the assembly available. A `null`/empty path
+throws `ArgumentException`; a native failure throws `HostingException`.
+
+## Loading from memory: `AssemblyBytesLoader`
+
+`load_assembly_bytes` (.NET 8+) loads an assembly straight from a `ReadOnlySpan<byte>` into the default
+context, with optional PDB bytes for symbols. It performs **no** file-based dependency resolution, so
+any dependencies must already be loadable in the default context.
+
+```csharp
+using System.IO;
+using HostFxrSharp.Contexts;
+using HostFxrSharp.Loading;
+
+void LoadFromMemory(HostContext host)
+{
+    byte[] assembly = File.ReadAllBytes(@"C:\components\Calculator\Calculator.dll");
+    byte[] symbols  = File.ReadAllBytes(@"C:\components\Calculator\Calculator.pdb");
+
+    AssemblyBytesLoader bytesLoader = host.GetAssemblyBytesLoader();
+    bytesLoader.Load(assembly, symbols); // symbols is optional
+
+    // Resolve entry points afterwards with GetFunctionPointerResolver(), as above.
+}
+```
+
+`AssemblyBytesLoader.Load` takes `ReadOnlySpan<byte>` for both arguments. An empty `assembly` span
+throws `ArgumentException`; the `symbols` span may be empty (the default).
+
+## Choosing a loader
+
+| You want to… | Use | Why |
+| --- | --- | --- |
+| Load a component in isolation and call a static method | `GetAssemblyFunctionPointerLoader()` | One-call isolated load + pointer; resolves `.deps.json`; widest runtime support (.NET Core 3.0+); AOT-friendly with `UnmanagedCallersOnly`. |
+| Call a method in an assembly already present in the default context | `GetFunctionPointerResolver()` | No re-load; shares the app's dependency graph (.NET 5+). |
+| Add an assembly (by path) to the default context, with dependency resolution | `GetAssemblyLoader()` | Applies the sibling `.deps.json`; combine with `GetFunctionPointerResolver()` (.NET 8+). |
+| Load an assembly you already hold in memory | `GetAssemblyBytesLoader()` | No file on disk needed; you own dependency resolution (.NET 8+). |
+
+Rules of thumb:
+
+- **Prefer `GetAssemblyFunctionPointerLoader()`** for plugin-style hosting: it is the most portable
+  (works back to .NET Core 3.0), gives you isolation and dependency resolution in a single call, and is
+  the path exercised most in the wild.
+- **Prefer `MethodSignature.UnmanagedCallersOnly`** for the method itself when you can: direct
+  `delegate* unmanaged<…>` invocation avoids marshalling and keeps the call site
+  [Native-AOT compatible](/docs/native-aot). `Default` and `FromDelegateType` go through
+  `Marshal.GetDelegateForFunctionPointer`, which is marshalling-based.
+- **Use the default-context loaders** only when you actually want components to share one resolution
+  scope; otherwise the isolation of `GetAssemblyFunctionPointerLoader()` is safer.
+
+## Native behavior and lifetimes
+
+- **One runtime per process.** All loads share a single runtime; the isolated loader isolates
+  `AssemblyLoadContext`s, not runtimes. See [How hosting works](/docs/concepts).
+- **Pointers and loaded assemblies live forever.** Returned function pointers are process-lifetime and
+  the underlying assembly cannot be unloaded. Resolve once and cache.
+- **Runtime start is one-way.** The first `Get…Loader` / `Resolve` / `RunApp` starts the runtime and
+  locks [runtime properties](/docs/guide/runtime-properties). Configure them first.
+- **`char_t` is marshalled for you.** Paths, type names, method names, and delegate type names are
+  native `char_t*` strings — UTF-16 on Windows, UTF-8 on Unix. You always pass ordinary `string`s; the
+  library allocates and frees the native buffers. See [Cross-platform](/docs/cross-platform).
+- **Threading.** A `HostContext` is not thread-safe: use one loader call at a time per context. The
+  function pointers you *obtain*, however, are ordinary native pointers you can invoke from any thread
+  once resolved.
+
+## Error handling
+
+Every loader validates its arguments (`ArgumentException` for `null`/empty strings or empty assembly
+bytes), guards against use of a default-constructed wrapper (`InvalidOperationException`), and maps
+native failures to a `HostingException` from `HostFxrSharp.Exceptions`. Requesting a delegate type the
+current runtime does not support surfaces through the same channel (for example
+`UnsupportedHostingScenarioException` for scenarios the runtime removed, such as WinRT activation on
+.NET 5+). Wrap loading in a single `try/catch (HostingException …)` as shown above.
+
+<Callout type="info">
+  See [Error handling](/docs/guide/error-handling) for the full exception hierarchy and how native
+  status codes map to managed exceptions.
+</Callout>
+
+## Next steps
+
+<Cards>
+  <Card title="Host contexts" href="/docs/guide/host-contexts" description="Initialize and dispose the context you load from." />
+  <Card title="Runtime properties" href="/docs/guide/runtime-properties" description="Configure the runtime before it starts and locks." />
+  <Card title="Running applications" href="/docs/guide/running-apps" description="The RunApp counterpart to loading components." />
+  <Card title="Native AOT" href="/docs/native-aot" description="Why the function-pointer path stays AOT-compatible." />
+  <Card title="Error handling" href="/docs/guide/error-handling" description="The full HostingException hierarchy." />
+  <Card title="API reference" href="/docs/api-reference" description="Every member of the HostFxrSharp.Loading types." />
+</Cards>

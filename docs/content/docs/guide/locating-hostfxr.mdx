@@ -1,0 +1,420 @@
+---
+title: Locating hostfxr
+description: Locate and load hostfxr via nethost, with resolution options or an explicit path.
+---
+
+Before HostFxrSharp can start a runtime, it must find and load the native `hostfxr`
+library on the current machine. This is the "locate hosting components" step, and it is the
+foundation every other operation builds on. This page covers the two things you can do here:
+
+- **Locate** `hostfxr` — ask the native `nethost` component for its full path, without loading it.
+- **Load** `hostfxr` — bring the library into the process so host contexts can be initialized.
+
+The two entry points for locating live on [`NetHost`](/docs/api-reference), and the two entry points for
+loading live on [`HostFxr`](/docs/api-reference). Both types are in the `HostFxrSharp` namespace.
+
+<Callout type="info">
+You rarely have to call these methods explicitly. `HostFxr.InitializeForCommandLine`
+and `HostFxr.InitializeForRuntimeConfig` both call `EnsureLoaded` for you on first use. Reach for
+the APIs on this page when you want to control *how* `hostfxr` is discovered, load it from an
+explicit location, or probe whether a compatible .NET install exists before committing to it.
+</Callout>
+
+## The locate-then-load model
+
+The native hosting flow has two distinct stages, and HostFxrSharp keeps them separate:
+
+| Stage | What it does | HostFxrSharp API | Native component |
+| --- | --- | --- | --- |
+| Locate | Resolve the absolute path to `hostfxr` | `NetHost.GetHostFxrPath` / `NetHost.TryGetHostFxrPath` | `nethost` (`get_hostfxr_path`) |
+| Load | Load that library into the process | `HostFxr.EnsureLoaded` / `HostFxr.LoadFrom` | `hostfxr` |
+
+You can stop after the locate stage (for example, to log or validate the path), or go straight to
+loading. Loading always implies a successful locate — except with `HostFxr.LoadFrom`, which skips
+`nethost` entirely and takes a path you already have.
+
+For the bigger picture of how `nethost`, `hostfxr`, and host contexts fit together, see
+[How hosting works](/docs/concepts).
+
+## Locating with NetHost
+
+`NetHost` wraps the native `get_hostfxr_path` function. The native API uses a size-then-fill buffer
+protocol (it tells you how big a buffer to allocate, then fills it); HostFxrSharp handles that entire
+dance internally — a stack buffer first, then pooled growth if the path is unusually long — and hands
+you back an ordinary `string`.
+
+### NetHost.GetHostFxrPath
+
+Returns the absolute path to `hostfxr`, or throws if it cannot be found.
+
+```csharp
+using HostFxrSharp;
+
+string hostFxrPath = NetHost.GetHostFxrPath();
+Console.WriteLine($"hostfxr is located at: {hostFxrPath}");
+```
+
+Signature and failure modes:
+
+| Member | Signature | Throws |
+| --- | --- | --- |
+| `GetHostFxrPath` | `string GetHostFxrPath(HostFxrResolutionOptions? options = null)` | `HostFxrNotFoundException` if `hostfxr` could not be located; `HostFxrResolutionException` if resolution failed for another reason |
+
+Both exceptions live in `HostFxrSharp.Exceptions` and derive from `HostingException`. See
+[Error handling](/docs/guide/error-handling) for the full hierarchy.
+
+### NetHost.TryGetHostFxrPath
+
+The non-throwing counterpart. It returns `false` (instead of throwing) when `hostfxr` cannot be
+located, which is convenient for probing whether a usable .NET install is present:
+
+```csharp
+using HostFxrSharp;
+
+if (NetHost.TryGetHostFxrPath(out string? hostFxrPath))
+{
+    Console.WriteLine($"Found hostfxr: {hostFxrPath}");
+}
+else
+{
+    Console.WriteLine("No compatible .NET install was found on this machine.");
+}
+```
+
+The `out` parameter is annotated `[NotNullWhen(true)]`, so the compiler knows `hostFxrPath` is
+non-null inside the `true` branch.
+
+| Member | Signature |
+| --- | --- |
+| `TryGetHostFxrPath` | `bool TryGetHostFxrPath(out string? path, HostFxrResolutionOptions? options = null)` |
+
+<Callout type="info">
+`TryGetHostFxrPath` only swallows `HostingException` (the "not found / could not resolve"
+family). It is a thin wrapper around `GetHostFxrPath`, so any programming error outside that family
+still surfaces normally.
+</Callout>
+
+## Resolution options
+
+Both `NetHost` methods (and, transitively, `HostFxr.EnsureLoaded`) accept an optional
+`HostFxrResolutionOptions`. It lives in the `HostFxrSharp.Resolution` namespace and has two
+init-only properties:
+
+| Property | Type | Meaning |
+| --- | --- | --- |
+| `AssemblyPath` | `string?` | Path to the component's assembly. When set (and `DotNetRoot` is not), `hostfxr` is located as if `AssemblyPath` were an `apphost` — that is, searched app-local first, then falling back to a machine install. |
+| `DotNetRoot` | `string?` | Path to the root of a .NET installation (the folder containing the `dotnet` executable). When set, `hostfxr` is located as if starting `dotnet app.dll` from that root. |
+
+### DotNetRoot takes precedence
+
+If **both** properties are set, `DotNetRoot` wins and `AssemblyPath` is **ignored** — this mirrors
+the native `nethost` semantics exactly. Keep this in mind: setting `AssemblyPath` alongside
+`DotNetRoot` has no effect.
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Resolution;
+
+var options = new HostFxrResolutionOptions
+{
+    DotNetRoot   = @"C:\Program Files\dotnet",
+    AssemblyPath = @"C:\apps\MyApp\MyApp.dll", // ignored — DotNetRoot takes precedence
+};
+
+// Resolves against C:\Program Files\dotnet, as if launching `dotnet MyApp.dll`.
+string hostFxrPath = NetHost.GetHostFxrPath(options);
+```
+
+To locate `hostfxr` relative to a specific application binary instead, set only `AssemblyPath`:
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Resolution;
+
+var options = new HostFxrResolutionOptions
+{
+    AssemblyPath = @"C:\apps\MyApp\MyApp.dll",
+};
+
+// Searches next to MyApp.dll first (a self-contained/app-local copy),
+// then falls back to a globally registered .NET install.
+string hostFxrPath = NetHost.GetHostFxrPath(options);
+```
+
+### Resolution order
+
+Given the options, `nethost` resolves `hostfxr` in this order:
+
+1. **`DotNetRoot` is set** → locate `hostfxr` under that .NET installation root (as if running
+   `dotnet app.dll`). `AssemblyPath` is ignored.
+2. **Only `AssemblyPath` is set** → locate `hostfxr` as if `AssemblyPath` were an `apphost`: app-local
+   next to the assembly first, then falling back to a machine-wide install.
+3. **Neither is set** (the default, `options is null`) → locate `hostfxr` via the `DOTNET_ROOT`
+   environment variable, or a globally registered install location.
+
+Passing `null` options — or no options at all — selects case 3, which is the ordinary "use whatever
+.NET is installed on this machine" behavior most applications want.
+
+### Platform-specific library names
+
+The file that `nethost` resolves has a platform-specific name, and so does `nethost` itself. You do
+not normally type these names — `NetHost` returns the fully qualified path for you — but they matter
+when you build a path by hand for [`HostFxr.LoadFrom`](#hostfxrloadfrom):
+
+| Platform | `nethost` | `hostfxr` |
+| --- | --- | --- |
+| Windows | `nethost.dll` | `hostfxr.dll` |
+| Linux | `libnethost.so` | `libhostfxr.so` |
+| macOS | `libnethost.dylib` | `libhostfxr.dylib` |
+
+<Callout type="info">
+Native host strings use `char_t`, which is **UTF-16 on Windows and UTF-8 on Unix**.
+HostFxrSharp marshals these per platform, so the paths you receive and pass are always ordinary
+.NET `string` values — you never deal with the encoding yourself. See
+[Cross-platform](/docs/cross-platform).
+</Callout>
+
+## Loading hostfxr
+
+Locating a path is not enough to do anything useful — the library has to be loaded into the process.
+`HostFxr` provides two ways to do that, and both are **idempotent and process-wide**: because a
+process can host only one runtime, a process loads exactly one `hostfxr`, and only the **first**
+successful load call takes effect. Later calls return immediately without reloading.
+
+You can read the currently loaded path at any time:
+
+```csharp
+using HostFxrSharp;
+
+// null until hostfxr has been loaded; the absolute path afterwards.
+string? loaded = HostFxr.LoadedHostFxrPath;
+```
+
+### HostFxr.EnsureLoaded
+
+Locates `hostfxr` via `nethost` and loads it — the locate-and-load path. This is what the
+`Initialize*` methods call for you, so calling it directly is only necessary when you want to load
+`hostfxr` up front or pass resolution options.
+
+```csharp
+using HostFxrSharp;
+
+HostFxr.EnsureLoaded();
+Console.WriteLine($"Loaded hostfxr from: {HostFxr.LoadedHostFxrPath}");
+```
+
+To steer discovery, pass `HostFxrResolutionOptions`. Because only the first call actually loads,
+**only the first call's options take effect** — supply them the first time `hostfxr` is loaded:
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Resolution;
+
+HostFxr.EnsureLoaded(new HostFxrResolutionOptions
+{
+    DotNetRoot = @"C:\Program Files\dotnet",
+});
+```
+
+| Member | Signature | Throws |
+| --- | --- | --- |
+| `EnsureLoaded` | `void EnsureLoaded(HostFxrResolutionOptions? options = null)` | `HostFxrNotFoundException` if `hostfxr` could not be located; `HostFxrResolutionException` if resolution or loading failed |
+
+### HostFxr.LoadFrom
+
+Loads `hostfxr` from an **explicit path**, bypassing `nethost` discovery entirely. Use this when you
+already know where `hostfxr` lives — an app-local, self-contained copy shipped next to your
+application, or a library you found in the machine .NET install. Because it never touches `nethost`,
+**no `nethost` library needs to be present** on the machine.
+
+```csharp
+using HostFxrSharp;
+
+// A self-contained deployment ships hostfxr alongside the app.
+string hostFxrPath = Path.Combine(AppContext.BaseDirectory, "hostfxr.dll");
+
+HostFxr.LoadFrom(hostFxrPath);
+Console.WriteLine($"Loaded hostfxr from: {HostFxr.LoadedHostFxrPath}");
+```
+
+A cross-platform variant picks the correct native file name for the current OS:
+
+```csharp
+using System.Runtime.InteropServices;
+using HostFxrSharp;
+
+static string HostFxrFileName()
+{
+    if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        return "hostfxr.dll";
+    if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        return "libhostfxr.dylib";
+    return "libhostfxr.so"; // Linux and other Unix
+}
+
+string hostFxrPath = Path.Combine(AppContext.BaseDirectory, HostFxrFileName());
+HostFxr.LoadFrom(hostFxrPath);
+```
+
+| Member | Signature | Throws |
+| --- | --- | --- |
+| `LoadFrom` | `void LoadFrom(string hostFxrPath)` | `ArgumentException` if `hostFxrPath` is `null` or empty; `HostFxrResolutionException` if the library could not be loaded |
+
+<Callout type="info">
+`LoadFrom` is also idempotent and process-wide. If `hostfxr` was already loaded — whether
+by an earlier `LoadFrom`, an `EnsureLoaded`, or an `Initialize*` call — `LoadFrom` returns without
+loading a second library. Load before any `Initialize*` call if you want your explicit path to win.
+</Callout>
+
+### EnsureLoaded vs. LoadFrom
+
+| | `EnsureLoaded` | `LoadFrom` |
+| --- | --- | --- |
+| Uses `nethost` to discover the path | Yes | No — you supply the path |
+| Requires a `nethost` library present | Yes | No |
+| Accepts `HostFxrResolutionOptions` | Yes | No |
+| Typical use | Framework-dependent apps using a machine-wide .NET install | Self-contained/app-local deployments, or a path you resolved yourself |
+| Idempotent, process-wide | Yes | Yes |
+
+## Error handling
+
+All failures surface as structured exceptions from `HostFxrSharp.Exceptions`, all deriving from
+`HostingException`. Catch the specific type you care about:
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Exceptions;
+
+try
+{
+    HostFxr.EnsureLoaded();
+}
+catch (HostFxrNotFoundException ex)
+{
+    // nethost could not locate hostfxr — likely no compatible .NET install.
+    Console.Error.WriteLine($".NET runtime not found: {ex.Message}");
+}
+catch (HostFxrResolutionException ex)
+{
+    // Located but could not be loaded, or resolution failed for another reason.
+    Console.Error.WriteLine($"Failed to load hostfxr: {ex.Message}");
+}
+```
+
+If you prefer to branch on presence without exceptions, use `NetHost.TryGetHostFxrPath` first, then
+load. See [Error handling](/docs/guide/error-handling) for the complete exception model.
+
+## Native behavior to keep in mind
+
+HostFxrSharp is a thin, faithful wrapper — it does not hide the fundamental rules of the native
+hosting components:
+
+<Callout type="warn">
+**One `hostfxr`, one runtime per process.** A process loads a single `hostfxr` and hosts a single
+.NET runtime. That is why loading is idempotent and why only the first load call's options matter.
+Attempting to initialize a second, incompatible runtime later throws `RuntimeAlreadyLoadedException`
+— see [Host contexts](/docs/guide/host-contexts).
+</Callout>
+
+<Callout type="info">
+**Runtime properties become read-only once the runtime starts.** Loading `hostfxr` does not start
+the runtime; that happens when a [host context](/docs/guide/host-contexts) runs. You can read and write
+[runtime properties](/docs/guide/runtime-properties) before the runtime starts, but once it is running
+they are read-only.
+</Callout>
+
+<Callout type="info">
+**Native-AOT friendly.** Locating and loading `hostfxr` go through source-generated P/Invokes and
+unmanaged function pointers — no reflection, no runtime code generation. The entire surface on this
+page works under Native-AOT. See [Native AOT](/docs/native-aot).
+</Callout>
+
+## Putting it together
+
+A complete example that probes for `hostfxr`, loads it, then hands off to a host context:
+
+<Steps>
+
+<Step>
+
+### Probe for a compatible .NET install
+
+Use the non-throwing `TryGetHostFxrPath` so a missing runtime is a branch, not an exception.
+
+```csharp
+using HostFxrSharp;
+
+if (!NetHost.TryGetHostFxrPath(out string? path))
+{
+    Console.Error.WriteLine("No compatible .NET runtime found. Install .NET and retry.");
+    return;
+}
+
+Console.WriteLine($"Discovered hostfxr at: {path}");
+```
+
+</Step>
+
+<Step>
+
+### Load hostfxr
+
+`EnsureLoaded` is idempotent — the options here steer discovery on the first load only. Wrap the
+call to translate any failure into a clean message.
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Exceptions;
+using HostFxrSharp.Resolution;
+
+try
+{
+    HostFxr.EnsureLoaded(new HostFxrResolutionOptions
+    {
+        // Omit for the default machine install, or pin an explicit root:
+        // DotNetRoot = @"C:\Program Files\dotnet",
+    });
+}
+catch (HostingException ex)
+{
+    Console.Error.WriteLine($"Could not load hostfxr: {ex.Message}");
+    return;
+}
+
+Console.WriteLine($"Loaded hostfxr: {HostFxr.LoadedHostFxrPath}");
+```
+
+</Step>
+
+<Step>
+
+### Initialize a host context and run the app
+
+Loading is already done, so `InitializeForCommandLine` reuses it. The returned `HostContext` is
+disposable; running it starts the runtime.
+
+```csharp
+using HostFxrSharp;
+
+using var app = HostFxr.InitializeForCommandLine(["MyApp.dll", "--verbose"]);
+int exitCode = app.RunApp();
+```
+
+</Step>
+
+</Steps>
+
+## Next steps
+
+<Cards>
+  <Card title="Getting started" href="/docs/getting-started" description="A complete, runnable walkthrough." />
+  <Card title="How hosting works" href="/docs/concepts" description="The mental model behind nethost, hostfxr, and host contexts." />
+  <Card title="Host contexts" href="/docs/guide/host-contexts" description="Initialize and manage a context once hostfxr is loaded." />
+  <Card title="Runtime properties" href="/docs/guide/runtime-properties" description="Read and write properties before the runtime starts." />
+  <Card title="Running applications" href="/docs/guide/running-apps" description="Start the runtime and run a managed app." />
+  <Card title="Loading assemblies" href="/docs/guide/loading-assemblies" description="Load assemblies and resolve function pointers." />
+  <Card title="Cross-platform" href="/docs/cross-platform" description="char_t marshalling and platform library names." />
+  <Card title="Native AOT" href="/docs/native-aot" description="Publishing HostFxrSharp with Native-AOT." />
+  <Card title="Error handling" href="/docs/guide/error-handling" description="The complete exception model." />
+  <Card title="API reference" href="/docs/api-reference" description="Every public type and member." />
+</Cards>

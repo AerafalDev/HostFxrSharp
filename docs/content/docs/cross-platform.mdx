@@ -1,0 +1,228 @@
+---
+title: Cross-platform
+description: How HostFxrSharp handles char_t encoding and native library names across Windows, Linux and macOS.
+---
+
+HostFxrSharp exposes a single, identical API on Windows, Linux, and macOS. The same C# code that locates `hostfxr`, starts the runtime, and runs or loads managed assemblies compiles and runs unchanged on every supported OS and architecture. This page explains how that works: how native strings are marshalled per platform, how the correct native library file name is chosen, and how `nethost` is located across the different runtime identifiers (RIDs).
+
+The two hard parts of being cross-platform against the native hosting components are hidden entirely:
+
+- The native `char_t` string type has a **different encoding on each platform** — UTF-16 on Windows, UTF-8 on Unix. HostFxrSharp marshals every string per platform, so your code only ever sees ordinary `string` values.
+- The native library has a **different file name on each platform** (`nethost.dll` / `libnethost.so` / `libnethost.dylib`) and lives in **different locations** depending on how the app was deployed. HostFxrSharp resolves all of this for you.
+
+## The `char_t` string problem
+
+The native hosting APIs (`nethost` and `hostfxr`) operate on `pal::char_t`. This is not a single type — it changes per platform:
+
+| Platform | `char_t` C type | Encoding | Unit size |
+| --- | --- | --- | --- |
+| Windows | `wchar_t` | UTF-16 | 2 bytes |
+| Linux | `char` | UTF-8 | 1 byte |
+| macOS | `char` | UTF-8 | 1 byte |
+
+Because the width and encoding differ, a naive marshalling of `string` would be wrong on at least one platform. HostFxrSharp solves this with an internal per-platform marshaller (`HostFxrSharp.Interop.NativeString`): native string parameters are passed across the P/Invoke boundary as opaque byte pointers, so **one** P/Invoke signature works on every OS, and the bytes behind that pointer are encoded and decoded according to the current platform.
+
+<Callout type="info">
+The UTF-16-vs-UTF-8 distinction is decided once from `OperatingSystem.IsWindows()` and cached — Windows `char_t` is UTF-16 (`wchar_t`), while Linux and macOS `char_t` is UTF-8 (`char`). There is no per-call platform sniffing on the hot path.
+</Callout>
+
+Conceptually, every native string is allocated and read like this — note this is what HostFxrSharp does **internally**; you never write it yourself:
+
+```csharp
+using System.Runtime.InteropServices;
+
+// Windows char_t is UTF-16 (wchar_t); Linux/macOS char_t is UTF-8 (char).
+static bool IsUtf16 => OperatingSystem.IsWindows();
+
+static nint AllocateNative(string value) =>
+    IsUtf16
+        ? Marshal.StringToCoTaskMemUni(value)   // UTF-16, 2 bytes/unit
+        : Marshal.StringToCoTaskMemUTF8(value); // UTF-8,  1 byte/unit
+
+static string? ReadNative(nint buffer) =>
+    IsUtf16
+        ? Marshal.PtrToStringUni(buffer)
+        : Marshal.PtrToStringUTF8(buffer);
+```
+
+The real marshaller also tracks the platform's `char_t` **unit size** (2 on Windows, 1 on Unix) so it can correctly decode fixed-length buffers returned by the native buffer protocols, where the host reports a length in `char_t` units rather than bytes. Allocations use `Marshal.FreeCoTaskMem`-compatible memory and are always freed after the native call returns.
+
+<Callout type="info">
+**You always work with `string`.** Every public method on `HostFxr` and the context types in `HostFxrSharp.Contexts` accepts and returns managed `string` values (command-line arguments, `.runtimeconfig.json` paths, runtime property keys and values, error messages). The UTF-16-vs-UTF-8 distinction never leaks into your code — see [How hosting works](/docs/concepts) for the surrounding model.
+</Callout>
+
+## Native library file names
+
+A native library base name maps to a different file name on each OS. HostFxrSharp derives the correct name at runtime:
+
+| Base name | Windows | Linux | macOS |
+| --- | --- | --- | --- |
+| `nethost` | `nethost.dll` | `libnethost.so` | `libnethost.dylib` |
+| `hostfxr` | `hostfxr.dll` | `libhostfxr.so` | `libhostfxr.dylib` |
+
+The rule is: Windows uses `<name>.dll`; macOS uses `lib<name>.dylib`; every other Unix (Linux) uses `lib<name>.so`. You never pass these file names yourself — HostFxrSharp builds the right one for the current platform when it searches for `nethost`.
+
+## Runtime identifiers (RIDs)
+
+To locate `nethost` inside a self-contained publish layout or a runtime pack, HostFxrSharp needs the current **portable RID** — a short `<os>-<arch>` string. It is composed from the OS and the process architecture:
+
+| Component | Values |
+| --- | --- |
+| OS | `win` (Windows), `osx` (macOS), `linux` (everything else) |
+| Architecture | `x64`, `x86`, `arm64`, `arm` (unknown architectures fall back to `x64`) |
+
+So the process running on 64-bit Windows uses `win-x64`, a Raspberry Pi build uses `linux-arm64`, an Apple-silicon Mac uses `osx-arm64`, and so on. The equivalent of the internal computation is:
+
+```csharp
+using System.Runtime.InteropServices;
+
+static string CurrentRid()
+{
+    string os =
+        OperatingSystem.IsWindows() ? "win" :
+        OperatingSystem.IsMacOS()   ? "osx" :
+                                      "linux";
+
+    string arch = RuntimeInformation.ProcessArchitecture switch
+    {
+        Architecture.X64   => "x64",
+        Architecture.X86   => "x86",
+        Architecture.Arm64 => "arm64",
+        Architecture.Arm   => "arm",
+        _                  => "x64",
+    };
+
+    return $"{os}-{arch}";
+}
+```
+
+<Callout type="warn">
+This is the *process* architecture, not the OS architecture. An x86 process running under WOW64 on 64-bit Windows resolves to `win-x86`, which is correct — it must load the matching x86 native library.
+</Callout>
+
+## How `nethost` is located
+
+`nethost` is the small native library whose job is to find `hostfxr`. HostFxrSharp installs a `DllImport` resolver for its own assembly and, when the `nethost` P/Invoke is first called, searches a fixed ordered list of candidate paths. The **first candidate that exists and loads** wins; if none load, resolution fails and you fall back to an explicit `hostfxr` path (see [Locating hostfxr](/docs/guide/locating-hostfxr)).
+
+The candidates are tried in this order:
+
+<Steps>
+
+<Step>
+
+### Application base directory
+
+`AppContext.BaseDirectory` + the platform file name (for example `nethost.dll` next to your app). This is where a self-contained publish places `nethost`.
+
+</Step>
+
+<Step>
+
+### Self-contained `runtimes` layout
+
+`<baseDir>/runtimes/<rid>/native/<fileName>` — evaluated for each RID candidate in order.
+
+</Step>
+
+<Step>
+
+### Installed app-host pack
+
+`<dotnetRoot>/packs/Microsoft.NETCore.App.Host.<rid>/<version>/runtimes/<rid>/native/<fileName>`, choosing the **highest installed version**. The `<dotnetRoot>` is derived from the running runtime directory, so this finds the copy of `nethost` shipped with an installed .NET SDK. This candidate is also evaluated for each RID candidate.
+
+</Step>
+
+</Steps>
+
+Steps 2 and 3 repeat for every RID candidate (see [the `linux-musl` fallback](#the-linux-musl-alpine-fallback) below), so on Linux the glibc RID is probed before the musl RID.
+
+Putting the pieces together, a typical Windows probe order for a framework-dependent app looks like:
+
+| Order | Candidate path (illustrative) |
+| --- | --- |
+| 1 | `<app>/nethost.dll` |
+| 2 | `<app>/runtimes/win-x64/native/nethost.dll` |
+| 3 | `C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Host.win-x64\<highest ver>\runtimes\win-x64\native\nethost.dll` |
+
+Once `nethost` loads, HostFxrSharp uses it to locate `hostfxr`, loads that library, and caches its handle. From then on the `hostfxr` P/Invokes resolve directly to the cached handle. If you already know where `hostfxr` is, you can skip `nethost` discovery entirely — see the deployment tips below.
+
+### The `linux-musl` (Alpine) fallback
+
+On Linux, HostFxrSharp probes an extra RID. musl-libc distributions such as **Alpine** publish their runtime packs under a `linux-musl-<arch>` RID rather than the glibc `linux-<arch>`. So on Linux the RID candidate list is:
+
+| Order | RID candidate |
+| --- | --- |
+| 1 | `linux-<arch>` (glibc — e.g. `linux-x64`, `linux-arm64`) |
+| 2 | `linux-musl-<arch>` (musl — e.g. `linux-musl-x64`, `linux-musl-arm64`) |
+
+Each RID candidate is expanded against both the `runtimes/<rid>/native` layout and the `Microsoft.NETCore.App.Host.<rid>` pack, so an Alpine deployment that ships `libnethost.so` under `runtimes/linux-musl-x64/native/` is found automatically. This fallback is Linux-only; Windows and macOS use a single RID.
+
+## Deployment tips
+
+The goal is simply that `nethost` (or `hostfxr` directly) is loadable at runtime. Pick whichever of these fits your deployment:
+
+- **Self-contained publish.** `dotnet publish -r <rid> --self-contained` copies the native host (`nethost.*`) next to your application, so candidate #1 (the app base directory) resolves with no extra work. This is the most portable option.
+
+- **Framework-dependent app on a machine with the .NET SDK.** The app-host pack (`Microsoft.NETCore.App.Host.<rid>`) is present under the dotnet root, so `nethost` is found via the pack candidate. No files need to ship with your app.
+
+- **Framework-dependent app on a machine with only the runtime installed.** The app-host **pack** may not be present. Either copy `nethost.*` next to your app (candidate #1), place it under `runtimes/<rid>/native/` (candidate #2), or bypass `nethost` and load `hostfxr` from its known install location (below).
+
+- **Ship `nethost` explicitly.** Add a copy of the correct native file for your target RID at either `<app>/nethost.dll` or `<app>/runtimes/<rid>/native/<fileName>`, matching the file-name and RID rules in the tables above.
+
+### Bypassing `nethost` entirely
+
+If `nethost` cannot be located — or you simply want deterministic behavior — load `hostfxr` from an explicit path before initializing. This skips the `nethost` search completely:
+
+```csharp
+using HostFxrSharp;
+
+// Load hostfxr directly; no nethost discovery is performed.
+HostFxr.LoadFrom(@"C:\Program Files\dotnet\host\fxr\10.0.0\hostfxr.dll");
+
+// From here the API is identical on every platform.
+using var app = HostFxr.InitializeForCommandLine(["MyApp.dll", "--verbose"]);
+int exitCode = app.RunApp();
+```
+
+On Unix the same call targets the platform file name and install location, for example `/usr/share/dotnet/host/fxr/10.0.0/libhostfxr.so` (Linux) or the equivalent `.dylib` on macOS. To let HostFxrSharp discover and load `hostfxr` up front (still via `nethost`), call `HostFxr.EnsureLoaded` instead. Both approaches — and the full set of resolution options — are covered in [Locating hostfxr](/docs/guide/locating-hostfxr).
+
+## The same code, everywhere
+
+Because marshalling and library resolution are handled internally, a complete host program is fully portable. Nothing in the following changes between Windows, Linux, and macOS:
+
+```csharp
+using HostFxrSharp;
+
+// Locate + load hostfxr (via nethost) and initialize the process runtime for a managed app.
+using var app = HostFxr.InitializeForCommandLine(["MyApp.dll"]);
+
+// Start the .NET runtime and run the application; returns its exit code.
+int exitCode = app.RunApp();
+
+Environment.Exit(exitCode);
+```
+
+The command-line array is a `string[]` — the managed entry assembly first, then its arguments — exactly as `hostfxr` expects, and the strings are marshalled to the platform's `char_t` for you. See [Running applications](/docs/guide/running-apps) for the full lifecycle, [Host contexts](/docs/guide/host-contexts) for `InitializeForRuntimeConfig`, and [Loading assemblies](/docs/guide/loading-assemblies) for resolving managed entry points.
+
+<Callout type="warn">
+**Platform behavior is the same, native rules still apply.** Cross-platform marshalling does not change the underlying hosting contract: only a **single runtime** can be loaded per process, and [runtime properties](/docs/guide/runtime-properties) become **read-only** once that runtime starts. Attempting to load a second, incompatible runtime throws `RuntimeAlreadyLoadedException` from the [`HostFxrSharp.Exceptions`](/docs/guide/error-handling) namespace on every platform alike.
+</Callout>
+
+## Native-AOT and portability
+
+The per-platform marshalling is deliberately reflection-free: it uses the branchless `OperatingSystem.Is*` checks and the built-in `Marshal` encoders, all of which are [Native-AOT compatible](/docs/native-aot). Combined with source-generated P/Invokes and the `DllImport` resolver described above, the entire cross-platform surface works identically under JIT and Native-AOT publishing — you can `dotnet publish -r <rid> --self-contained /p:PublishAot=true` and the resolver still finds `nethost` next to the published binary.
+
+## Next steps
+
+<Cards>
+  <Card title="Getting started" href="/docs/getting-started" description="A complete, runnable walkthrough of hosting a managed app." />
+  <Card title="How hosting works" href="/docs/concepts" description="The mental model behind nethost, hostfxr, and host contexts." />
+  <Card title="Locating hostfxr" href="/docs/guide/locating-hostfxr" description="Discovery, explicit paths, and resolution options." />
+  <Card title="Host contexts" href="/docs/guide/host-contexts" description="Command-line and runtime-config initialization." />
+  <Card title="Running applications" href="/docs/guide/running-apps" description="Starting the runtime and returning an exit code." />
+  <Card title="Loading assemblies" href="/docs/guide/loading-assemblies" description="Resolving native function pointers to managed methods." />
+  <Card title="Runtime properties" href="/docs/guide/runtime-properties" description="Reading and writing properties before the runtime starts." />
+  <Card title="Error handling" href="/docs/guide/error-handling" description="Structured exceptions for native status codes." />
+  <Card title="Native AOT" href="/docs/native-aot" description="Publishing HostFxrSharp ahead-of-time." />
+  <Card title="API reference" href="/docs/api-reference" description="Every public type and member." />
+</Cards>

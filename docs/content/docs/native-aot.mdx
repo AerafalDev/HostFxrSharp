@@ -1,0 +1,389 @@
+---
+title: Native AOT
+description: Why HostFxrSharp is Native-AOT compatible and how to publish an AOT app with it.
+---
+
+HostFxrSharp is designed from the ground up to survive **Native AOT** publishing
+(`PublishAot`). Every native access goes through source-generated P/Invokes and unmanaged
+function pointers, the single managed-to-native callback is a static `[UnmanagedCallersOnly]`
+trampoline, and no part of the library relies on runtime reflection or dynamic code
+generation. You can compile a launcher that locates `hostfxr`, starts the .NET runtime, and
+runs or loads managed code — and ship it as a fully ahead-of-time-compiled native executable.
+
+This page explains *why* the wrapper is AOT-safe, how to consume it from an AOT-published
+app, and how to call managed methods across the boundary without any delegate marshalling.
+
+<Callout type="info">
+  **What Native AOT applies to.** AOT compiles **your host application** — the launcher that
+  uses HostFxrSharp. `hostfxr` then locates and loads a full .NET runtime to execute the
+  target app or component; that hosted runtime is JIT-based. HostFxrSharp being AOT-compatible
+  means the *launcher* can be shipped as a self-contained native binary. See
+  [How hosting works](/docs/concepts) for the mental model.
+</Callout>
+
+## Why HostFxrSharp is Native-AOT compatible
+
+Native AOT forbids the runtime features that most interop layers lean on: no runtime-generated
+marshalling stubs for `[DllImport]`, no `Marshal.GetDelegateForFunctionPointer` /
+`Marshal.GetFunctionPointerForDelegate` round-trips, and no reflection over types trimmed away
+at publish time. HostFxrSharp avoids all of them by construction.
+
+| AOT-hostile pattern | HostFxrSharp instead uses |
+| --- | --- |
+| `[DllImport]` (runtime marshalling stub) | Source-generated `[LibraryImport]` P/Invokes |
+| `Marshal.GetDelegateForFunctionPointer` | `delegate* unmanaged` function pointers |
+| `Marshal.GetFunctionPointerForDelegate` | A static `[UnmanagedCallersOnly]` trampoline |
+| Reflection / dynamic code | None — all call sites are statically resolved |
+
+### Source-generated P/Invokes
+
+Every call into `nethost` and `hostfxr` is declared with `[LibraryImport]`. The interop source
+generator emits the marshalling code at **compile time**, so there is no runtime IL generation
+and no trimming warning. Classic `[DllImport]` would require the runtime to build a marshalling
+stub on first call — exactly what Native AOT cannot do.
+
+### Unmanaged function pointers, no delegate marshalling
+
+The runtime helpers returned by a host context are consumed as raw C# function pointers rather
+than managed delegates. For example, the assembly loader in
+[`HostFxrSharp.Loading`](/docs/guide/loading-assemblies) wraps the native
+`load_assembly_and_get_function_pointer` helper directly:
+
+```csharp
+// Internal shape of AssemblyFunctionPointerLoader — no managed delegate is ever created.
+private readonly delegate* unmanaged[Stdcall]<byte*, byte*, byte*, byte*, void*, void**, int> _fn;
+```
+
+Because the pointer is invoked through `delegate* unmanaged[...]` syntax, there is no
+`Marshal`-based delegate wrapping in either direction. The function pointers you receive from
+`Load` are likewise plain `nint` values you invoke through unmanaged function-pointer casts (see
+[below](#calling-managed-methods-without-marshalling)).
+
+### The single managed-to-native callback is a static trampoline
+
+The one place code has to flow *from* native *into* managed is the diagnostic error writer
+installed by `HostFxr.SetErrorWriter`. Instead of handing `hostfxr` a marshalled delegate, the
+library installs the address of a `static` method annotated with `[UnmanagedCallersOnly]`:
+
+```csharp
+// How HostFxrSharp registers the callback (simplified from the library source).
+[UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+private static unsafe void ErrorWriterTrampoline(byte* message)
+{
+    // Reads the native char_t* message and forwards it to the user's HostErrorWriter.
+    // Exceptions are swallowed here: crossing native -> managed with an exception is undefined.
+}
+
+// Installed as a plain function-pointer address — no delegate, no GC handle:
+// (delegate* unmanaged[Cdecl]<byte*, void>)&ErrorWriterTrampoline
+```
+
+A `[UnmanagedCallersOnly]` method has a fixed native address the compiler can take with `&`,
+so it needs no marshalled delegate and no keep-alive `GCHandle`. This is the canonical
+AOT-safe callback pattern, and it is the *only* managed-to-native callback in the whole
+library.
+
+### No reflection
+
+HostFxrSharp resolves nothing by reflection. Type and method names for the assemblies you load
+are passed through to the **hosted** runtime as strings — they name members in the JIT-loaded
+guest, never in your AOT host — so the trimmer has nothing to preserve on the host side.
+
+<Callout type="info">
+  **The AOT guarantee, in short.** All native access uses source-generated P/Invokes and
+  unmanaged function pointers; the only managed-to-native callback uses a static
+  `[UnmanagedCallersOnly]` method. The entire public surface is Native-AOT compatible — no
+  trimming warnings, no `rd.xml`, no feature switches required.
+</Callout>
+
+## Consuming HostFxrSharp from an AOT-published app
+
+Building an AOT launcher is three steps: enable AOT, publish per-RID, and write the launcher
+exactly as you would for a JIT build.
+
+<Steps>
+
+<Step>
+
+### Enable Native AOT
+
+Turn on `PublishAot` in the launcher's project file:
+
+```xml
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <PublishAot>true</PublishAot>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="HostFxrSharp" Version="1.0.0" />
+  </ItemGroup>
+
+</Project>
+```
+
+<Callout type="info">
+  `<AllowUnsafeBlocks>` is only needed if *your* code invokes the returned function pointers (as
+  in the [marshalling-free section](#calling-managed-methods-without-marshalling)); the wrapper's
+  own APIs do not require it.
+</Callout>
+
+</Step>
+
+<Step>
+
+### Publish per runtime identifier
+
+Native AOT is inherently self-contained and per-RID, so publish with an explicit runtime
+identifier:
+
+```sh
+dotnet publish -c Release -r win-x64
+dotnet publish -c Release -r linux-x64
+dotnet publish -c Release -r osx-arm64
+```
+
+The resulting native executable has no external managed dependency of its own.
+
+</Step>
+
+<Step>
+
+### Write the launcher
+
+A minimal launcher that boots a managed application looks exactly like the JIT version —
+nothing about the calling code changes for AOT:
+
+```csharp
+using HostFxrSharp;
+
+// Locate + load hostfxr (via nethost), initialize the process runtime for a managed app,
+// then start the runtime and run it. Returns the app's exit code.
+using HostFxrSharp.Contexts.HostContext app =
+    HostFxr.InitializeForCommandLine(["MyApp.dll", "--verbose"]);
+
+int exitCode = app.RunApp();
+return exitCode;
+```
+
+</Step>
+
+</Steps>
+
+<Callout type="info">
+  **`nethost` at publish time.** `HostFxr.InitializeForCommandLine` uses `nethost` to discover
+  `hostfxr` on first use. If you would rather not carry `nethost` next to your AOT binary, call
+  `HostFxr.LoadFrom(hostFxrPath)` first to load an explicit, app-local or machine-installed
+  `hostfxr` — no `nethost` needed. See [Locating hostfxr](/docs/guide/locating-hostfxr).
+</Callout>
+
+## Calling managed methods without marshalling
+
+When you [load an assembly](/docs/guide/loading-assemblies) and ask for a function pointer to one
+of its `static` methods, HostFxrSharp lets you describe the target method's signature through
+`MethodSignature` (in `HostFxrSharp.Loading`). Three shapes are available:
+
+| Factory | Native `delegate_type_name` | Meaning |
+| --- | --- | --- |
+| `MethodSignature.Default` | `NULL` | The standard component entry point: `int Method(nint arg, int argSize)`. |
+| `MethodSignature.UnmanagedCallersOnly` | `UNMANAGEDCALLERSONLY_METHOD` sentinel | The target method carries `[UnmanagedCallersOnly]` (.NET 5+). |
+| `MethodSignature.FromDelegateType(name)` | assembly-qualified delegate type name | The target matches a specific delegate type. |
+
+`MethodSignature.UnmanagedCallersOnly` is the **marshalling-free** path. The hosted runtime
+returns a direct pointer to the target method instead of generating a delegate marshalling stub
+to wrap it, and you invoke it through a plain unmanaged function-pointer cast. This keeps the
+boundary blittable and stub-free on both sides.
+
+`FromDelegateType` and the default component entry point, by contrast, cause the **hosted**
+runtime to synthesize a marshalling delegate. That is legal (the guest is JIT-based), but it
+means the parameters flow through the runtime's marshaller. Prefer
+`MethodSignature.UnmanagedCallersOnly` whenever you control the target method.
+
+<Steps>
+
+<Step>
+
+### The component side
+
+Mark the target `static` method with `[UnmanagedCallersOnly]` and keep its parameters and
+return type blittable:
+
+```csharp
+using System.Runtime.InteropServices;
+
+namespace MyComponent;
+
+public static class Exports
+{
+    [UnmanagedCallersOnly]
+    public static int Add(int a, int b) => a + b;
+}
+```
+
+</Step>
+
+<Step>
+
+### The host side
+
+Obtain an `AssemblyFunctionPointerLoader` from your host context (see
+[Loading assemblies](/docs/guide/loading-assemblies) and
+[Host contexts](/docs/guide/host-contexts) for how to acquire one), then request the pointer
+with `MethodSignature.UnmanagedCallersOnly` and call it directly:
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Contexts;
+using HostFxrSharp.Loading;
+
+// Initialize a framework-dependent component from its .runtimeconfig.json.
+using HostContext host = HostFxr.InitializeForRuntimeConfig(
+    @"C:\components\MyComponent\MyComponent.runtimeconfig.json");
+
+// Acquire the loader from the host context (see "Loading assemblies").
+AssemblyFunctionPointerLoader loader = host.GetFunctionPointerLoader();
+
+// Resolve a native pointer to the [UnmanagedCallersOnly] method — no delegate marshalling.
+nint ptr = loader.Load(
+    assemblyPath: @"C:\components\MyComponent\MyComponent.dll",
+    typeName: "MyComponent.Exports, MyComponent",
+    methodName: "Add",
+    signature: MethodSignature.UnmanagedCallersOnly);
+```
+
+</Step>
+
+<Step>
+
+### Invoke through an unmanaged function-pointer cast
+
+The returned `nint` is a stable, process-lifetime pointer to the managed method. Cast it to a
+`delegate* unmanaged<...>` whose parameter and return types match the target exactly (requires
+an `unsafe` context):
+
+```csharp
+unsafe
+{
+    var add = (delegate* unmanaged<int, int, int>)ptr;
+    int result = add(2, 3); // 5
+    Console.WriteLine(result);
+}
+```
+
+If the component method declares a specific calling convention (for example
+`[UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]`), match it on the cast
+(`delegate* unmanaged[Cdecl]<...>`).
+
+</Step>
+
+</Steps>
+
+<Callout type="info">
+  **Method name shown for illustration.** The exact API for obtaining the loader from a
+  `HostContext` is documented on [Loading assemblies](/docs/guide/loading-assemblies); use that
+  page as the source of truth for the acquisition step. Everything else in the snippet —
+  `MethodSignature.UnmanagedCallersOnly`, `loader.Load(...)`, and the function-pointer cast —
+  is the API described here.
+</Callout>
+
+## The error writer: the one callback in practice
+
+`HostFxr.SetErrorWriter` is the user-facing side of the `[UnmanagedCallersOnly]` trampoline.
+You pass an ordinary managed `HostErrorWriter` delegate; the library routes native diagnostic
+messages to it through the static trampoline, so it works unchanged under AOT:
+
+```csharp
+using HostFxrSharp;
+
+// Install a process-wide diagnostic writer; dispose the registration to remove it.
+using IDisposable registration = HostFxr.SetErrorWriter(
+    message => Console.Error.WriteLine($"[hostfxr] {message}"));
+
+using var app = HostFxr.InitializeForCommandLine(["MyApp.dll"]);
+int exitCode = app.RunApp();
+```
+
+The native error writer is process-global, so the most recent registration wins, and disposing
+the returned registration detaches your callback. See
+[Error handling](/docs/guide/error-handling) for how failures surface as structured exceptions.
+
+## Caveats
+
+A few facts about the native hosting layer are unchanged by AOT — HostFxrSharp is a faithful,
+thin wrapper and does not paper over them.
+
+<Callout type="warn">
+  **The hosted runtime is JIT-based.** AOT applies to your launcher. `hostfxr` loads a full
+  .NET runtime to run the target app or component; that runtime uses the JIT. Native AOT does
+  not turn the *guest* into ahead-of-time code — it makes the *host* shippable as native.
+</Callout>
+
+<Callout type="warn">
+  **One runtime per process.** Only a single `hostfxr`-loaded runtime exists per process. The
+  first initialized context owns it; later `InitializeForRuntimeConfig` calls attach as
+  secondary contexts. Attempting to load a second, incompatible runtime throws
+  `RuntimeAlreadyLoadedException` (in `HostFxrSharp.Exceptions`). Your AOT host runtime is
+  independent of that hosted runtime. See [Host contexts](/docs/guide/host-contexts).
+</Callout>
+
+<Callout type="info">
+  **Properties become read-only once the runtime starts.** You may read and write
+  [runtime properties](/docs/guide/runtime-properties) on a context *before* it starts the
+  runtime. Afterward, use `HostFxr.GetActiveRuntimeProperties` or
+  `HostFxr.TryGetActiveRuntimeProperty` to inspect the active runtime.
+</Callout>
+
+<Callout type="info">
+  **`char_t` is platform-specific.** Native host strings are UTF-16 on Windows and UTF-8 on
+  Unix. HostFxrSharp marshals per platform, so your C# always works with ordinary `string`
+  values regardless of target RID. See [Cross-platform](/docs/cross-platform).
+</Callout>
+
+<Callout type="warn">
+  **Blittable signatures for the marshalling-free path.**
+  `MethodSignature.UnmanagedCallersOnly` requires the target method to be a `static`
+  `[UnmanagedCallersOnly]` method with blittable parameters and return type. Non-blittable
+  arguments need a delegate-type signature (`MethodSignature.FromDelegateType`) and go through
+  the hosted runtime's marshaller instead.
+</Callout>
+
+<Callout type="warn">
+  **Function pointers have process lifetime.** The pointer returned by `Load` is valid for the
+  life of the process; the loaded managed component is placed in an isolated
+  `AssemblyLoadContext` and cannot be unloaded.
+</Callout>
+
+## Next steps
+
+<Cards>
+  <Card
+    title="Getting started"
+    href="/docs/getting-started"
+    description="A complete, runnable walkthrough from install to first launch."
+  />
+  <Card
+    title="How hosting works"
+    href="/docs/concepts"
+    description="The model behind nethost, hostfxr, and host contexts."
+  />
+  <Card
+    title="Loading assemblies"
+    href="/docs/guide/loading-assemblies"
+    description="Obtain a loader and resolve native function pointers."
+  />
+  <Card
+    title="Cross-platform"
+    href="/docs/cross-platform"
+    description="RIDs, char_t encoding, and per-platform behavior."
+  />
+  <Card
+    title="API reference"
+    href="/docs/api-reference"
+    description="Every public type and member."
+  />
+</Cards>

@@ -1,0 +1,375 @@
+---
+title: Runtime properties
+description: Read and write runtime properties, and inspect the active runtime.
+---
+
+Runtime properties are the string key/value pairs the .NET runtime reads at startup — the same
+values that `hostfxr` materializes from a component's `.runtimeconfig.json` and its `configProperties`
+section. They cover both framework knobs (`RUNTIME_IDENTIFIER`, `TRUSTED_PLATFORM_ASSEMBLIES`,
+`APP_CONTEXT_BASE_DIRECTORY`, probing paths) and app-context switches (`System.GC.Server`,
+`System.Runtime.TieredCompilation`, and any custom `System.*` flag your app reads through
+`AppContext`).
+
+Every [`HostContext`](/docs/guide/host-contexts) exposes its properties through the
+`HostContext.Properties` accessor, an instance of `HostFxrSharp.Contexts.RuntimeProperties`. That
+type lets you **read** properties at any time before disposal, and **modify** them on the first
+context up until the runtime starts. Once the runtime is running you can still inspect the live set
+through the process-wide `HostFxr.GetActiveRuntimeProperties` and
+`HostFxr.TryGetActiveRuntimeProperty` helpers.
+
+<Callout type="info">
+  **Native strings.** Property names and values cross the native boundary as `char_t` — UTF-16 on
+  Windows, UTF-8 on Unix. HostFxrSharp marshals per platform and copies every native value pointer
+  into a managed `string` before returning it, so you always work with ordinary `string`s and never
+  touch the native "valid only until the next run/close/set call" rule. See
+  [Cross-platform](/docs/cross-platform).
+</Callout>
+
+## The property lifecycle
+
+Because a process loads a [single runtime](/docs/concepts), the timing rules matter:
+
+| Operation | Where it is allowed | Available when |
+| --- | --- | --- |
+| Read (`indexer`, `TryGetValue`, `GetAll`) | Any context | Always, until the context is disposed |
+| Modify (`Set`) | The **first** (runtime-owning) context only | Only **before** the runtime starts |
+| Read active properties (`HostFxr.GetActiveRuntimeProperties`) | Process-wide (native `NULL` handle) | After a runtime has been loaded |
+
+The runtime "starts" the moment you request any runtime delegate (for example
+`HostContext.GetFunctionPointerResolver`) or call `HostContext.RunApp`. From that point on the
+property set is frozen and `Set` throws.
+
+## Reading properties
+
+Reads are always allowed while the owning context is alive. All three read APIs live on
+`HostContext.Properties`.
+
+### Indexer
+
+The indexer returns the value directly and throws
+`HostFxrSharp.Exceptions.RuntimePropertyNotFoundException` if the property does not exist. Use it when
+the property is expected to be present.
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Contexts;
+
+using HostContext context = HostFxr.InitializeForRuntimeConfig("MyComponent.runtimeconfig.json");
+RuntimeProperties properties = context.Properties;
+
+// Throws RuntimePropertyNotFoundException if the property is absent.
+string tpa = properties["TRUSTED_PLATFORM_ASSEMBLIES"];
+Console.WriteLine($"TPA list length: {tpa.Length}");
+```
+
+### TryGetValue
+
+`TryGetValue` follows the standard `Try` pattern: it returns `true` and the value when the property
+exists, or `false` with a `null` value when it does not. It never throws for a missing property.
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Contexts;
+
+using HostContext context = HostFxr.InitializeForRuntimeConfig("MyComponent.runtimeconfig.json");
+RuntimeProperties properties = context.Properties;
+
+if (properties.TryGetValue("APP_CONTEXT_BASE_DIRECTORY", out string? baseDirectory))
+    Console.WriteLine($"Base directory: {baseDirectory}");
+else
+    Console.WriteLine("APP_CONTEXT_BASE_DIRECTORY is not set.");
+```
+
+### GetAll
+
+`GetAll` returns an immutable snapshot of every property for the context as an
+`IReadOnlyDictionary<string, string>` with **ordinal** key comparison. The dictionary is a copy — it
+does not track later changes.
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Contexts;
+
+using HostContext context = HostFxr.InitializeForRuntimeConfig("MyComponent.runtimeconfig.json");
+
+IReadOnlyDictionary<string, string> all = context.Properties.GetAll();
+
+Console.WriteLine($"{all.Count} runtime properties:");
+foreach ((string name, string value) in all)
+    Console.WriteLine($"  {name} = {value}");
+```
+
+## Modifying properties
+
+Modification is deliberately narrow: it is legal only on the **first** context in the process (the one
+that owns the runtime) and only **before** the runtime has started. Secondary contexts — created when
+you call `HostFxr.InitializeForRuntimeConfig` after a runtime is already loaded — are read-only,
+because they attach to the runtime the first context already configured.
+
+### CanModify
+
+`RuntimeProperties.CanModify` tells you whether `Set` will currently succeed. It returns `true` only
+when the owning context is not disposed, is the first context (`HostContextKind.First`), and the
+runtime has not yet started. It never throws — check it instead of catching an exception.
+
+```csharp
+if (context.Properties.CanModify)
+{
+    // Safe to call Set here.
+}
+```
+
+### Set
+
+`Set(string name, string? value)` adds or overwrites a property. Passing `null` as the value
+**removes** the property.
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Contexts;
+using HostFxrSharp.Loading;
+
+using HostContext context = HostFxr.InitializeForRuntimeConfig("MyComponent.runtimeconfig.json");
+RuntimeProperties properties = context.Properties;
+
+if (context.Kind is HostContextKind.First && properties.CanModify)
+{
+    // Add or overwrite properties the runtime will observe at startup.
+    properties.Set("System.GC.Server", "true");
+    properties.Set("System.Runtime.TieredCompilation", "false");
+
+    // A null value removes the property entirely.
+    properties.Set("System.GC.Concurrent", null);
+}
+
+// Requesting a delegate starts the runtime — after this the property set is frozen.
+FunctionPointerResolver resolver = context.GetFunctionPointerResolver();
+```
+
+<Callout type="warn">
+  Calling `Set` on a secondary context, or after the runtime has started, throws
+  `InvalidOperationException`. A native failure from `hostfxr_set_runtime_property_value` surfaces as
+  `HostFxrSharp.Exceptions.HostingException`. A `null` or empty `name` throws `ArgumentException`, and
+  using the accessor after disposing the context throws `ObjectDisposedException`.
+</Callout>
+
+### Configure, then start
+
+Modifying properties is a short, ordered sequence: initialize the first context, write every property
+you need, and only then start the runtime. Because startup freezes the set, do all of your `Set`
+calls before requesting a delegate or running the app.
+
+<Steps>
+
+<Step>
+
+### Initialize the first context
+
+`HostFxr.InitializeForRuntimeConfig` returns the runtime-owning context the first time it is called in
+the process. Confirm you own the runtime with `context.Kind`.
+
+```csharp
+using HostContext context = HostFxr.InitializeForRuntimeConfig("MyComponent.runtimeconfig.json");
+Debug.Assert(context.Kind is HostContextKind.First);
+```
+
+</Step>
+
+<Step>
+
+### Set every property up front
+
+Apply all changes while `CanModify` is still `true`. Nothing is committed to the runtime yet.
+
+```csharp
+context.Properties.Set("System.GC.Server", "true");
+context.Properties.Set("System.Runtime.TieredCompilation", "false");
+```
+
+</Step>
+
+<Step>
+
+### Start the runtime
+
+Requesting a delegate (or calling `RunApp`) commits the properties and freezes the set.
+
+```csharp
+FunctionPointerResolver resolver = context.GetFunctionPointerResolver();
+// context.Properties.CanModify is now false.
+```
+
+</Step>
+
+</Steps>
+
+## When properties become read-only
+
+The property set is frozen the instant the runtime starts. Two operations start it:
+
+| Operation | Method | Effect |
+| --- | --- | --- |
+| Requesting a runtime delegate | `GetRuntimeDelegate`, `GetFunctionPointerResolver`, `GetAssemblyFunctionPointerLoader`, `GetAssemblyLoader`, `GetAssemblyBytesLoader` | Starts the runtime, then properties become read-only |
+| Running an application | `RunApp` | Starts the runtime and runs the app; properties become read-only |
+
+After either call, `CanModify` returns `false` and `Set` throws `InvalidOperationException`. Reads
+continue to work.
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Contexts;
+using HostFxrSharp.Loading;
+
+using HostContext context = HostFxr.InitializeForRuntimeConfig("MyComponent.runtimeconfig.json");
+
+// Legal: the runtime has not started yet.
+context.Properties.Set("System.GC.Server", "true");
+
+// Starting the runtime freezes the property set.
+AssemblyFunctionPointerLoader loader = context.GetAssemblyFunctionPointerLoader();
+
+Console.WriteLine(context.Properties.CanModify); // False
+
+try
+{
+    context.Properties.Set("System.GC.Server", "false"); // too late
+}
+catch (InvalidOperationException ex)
+{
+    Console.WriteLine(ex.Message);
+    // "Runtime properties cannot be modified after the runtime has started ..."
+}
+```
+
+## Reading the active runtime's properties
+
+Once a runtime is running you no longer need a `HostContext` to inspect its properties. `HostFxr`
+exposes two static helpers that operate on the process's active context (the native
+`host_context_handle == NULL`). They require a loaded runtime — call them after a context has started
+one.
+
+`HostFxr.GetActiveRuntimeProperties` returns a snapshot of every live property, and
+`HostFxr.TryGetActiveRuntimeProperty` follows the same `Try` pattern as `RuntimeProperties.TryGetValue`.
+
+```csharp
+using HostFxrSharp;
+
+// After the runtime is running (in this or another context), read the live set.
+IReadOnlyDictionary<string, string> active = HostFxr.GetActiveRuntimeProperties();
+Console.WriteLine($"Active runtime exposes {active.Count} properties.");
+
+if (HostFxr.TryGetActiveRuntimeProperty("RUNTIME_IDENTIFIER", out string? rid))
+    Console.WriteLine($"Running on RID: {rid}");
+else
+    Console.WriteLine("RUNTIME_IDENTIFIER is not exposed.");
+```
+
+<Callout type="info">
+  These helpers read the runtime that is actually loaded, which is the set the first context
+  committed at startup. Modifications a secondary context might have "requested" are not reflected
+  here — the running runtime keeps its original values.
+</Callout>
+
+## Secondary contexts and differing properties
+
+When you initialize a secondary context whose configuration asks for properties that differ from those
+already committed by the running runtime, the initialization succeeds but flags
+`HostContext.RuntimePropertiesDiffer` as `true` (native
+`SuccessDifferentRuntimeProperties`). The running runtime ignores the divergent values. Call
+`HostContext.GetConflictingRuntimeProperties` to enumerate exactly which properties differ so you can
+decide whether to proceed. It returns an `IReadOnlyList<RuntimePropertyConflict>`, each entry carrying
+the property name, the value your configuration requested, and the value the running runtime actually
+uses. See [Host contexts](/docs/guide/host-contexts) for the full walkthrough.
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Contexts;
+
+using HostContext context = HostFxr.InitializeForRuntimeConfig("Secondary.runtimeconfig.json");
+
+if (context.Kind is HostContextKind.Secondary && context.RuntimePropertiesDiffer)
+{
+    IReadOnlyList<RuntimePropertyConflict> conflicts = context.GetConflictingRuntimeProperties();
+    Console.WriteLine($"{conflicts.Count} requested properties differ from the running runtime.");
+
+    foreach (RuntimePropertyConflict conflict in conflicts)
+        Console.WriteLine($"  {conflict.Name}: requested='{conflict.RequestedValue}', active='{conflict.ActiveValue}'");
+}
+```
+
+## Exceptions at a glance
+
+Members live in `HostFxrSharp.Contexts` (`RuntimeProperties`, `HostContext`) and `HostFxrSharp`
+(`HostFxr`). Exception types are from `HostFxrSharp.Exceptions` unless noted as `System`.
+
+| Member | Exception | Condition |
+| --- | --- | --- |
+| `properties[name]` | `ArgumentException` (System) | `name` is `null` or empty |
+| | `ObjectDisposedException` (System) | Owning context disposed |
+| | `RuntimePropertyNotFoundException` | Property does not exist |
+| `properties.TryGetValue` | `ArgumentException` (System) | `name` is `null` or empty |
+| | `ObjectDisposedException` (System) | Owning context disposed |
+| `properties.Set` | `ArgumentException` (System) | `name` is `null` or empty |
+| | `ObjectDisposedException` (System) | Owning context disposed |
+| | `InvalidOperationException` (System) | Secondary context, or runtime already started |
+| | `HostingException` | Native `set_runtime_property_value` failed |
+| `properties.GetAll` | `ObjectDisposedException` (System) | Owning context disposed |
+| `properties.CanModify` | — | Never throws; returns `false` instead |
+| `HostFxr.TryGetActiveRuntimeProperty` | `ArgumentException` (System) | `name` is `null` or empty |
+
+See [Error handling](/docs/guide/error-handling) for the full exception hierarchy and mapping from
+native status codes.
+
+## Native behavior you should know
+
+- **Single runtime per process.** Only one runtime is ever loaded, and only the first context can
+  shape it. This is why `Set` is restricted to the first context before start. See
+  [How hosting works](/docs/concepts).
+- **Read-only after start.** Requesting any delegate or running the app commits the properties to the
+  runtime; they cannot change afterward. Inspect the live set with the active-property helpers.
+- **`char_t` encoding.** Names and values are UTF-16 on Windows and UTF-8 on Unix; HostFxrSharp copies
+  each native value into a managed `string`, so returned values remain valid after subsequent
+  run/close/set calls. See [Cross-platform](/docs/cross-platform).
+- **Native-AOT friendly.** Reading, modifying, and enumerating properties go entirely through
+  source-generated P/Invokes and unmanaged buffers — no reflection — so this surface is fully
+  [Native-AOT compatible](/docs/native-aot).
+
+## Next steps
+
+<Cards>
+  <Card
+    title="Getting started"
+    href="/docs/getting-started"
+    description="A runnable end-to-end walkthrough of loading and hosting the runtime."
+  />
+  <Card
+    title="Host contexts"
+    href="/docs/guide/host-contexts"
+    description="First vs. secondary contexts and conflicting runtime properties."
+  />
+  <Card
+    title="Running applications"
+    href="/docs/guide/running-apps"
+    description="How RunApp starts the runtime and executes a managed app."
+  />
+  <Card
+    title="Loading assemblies"
+    href="/docs/guide/loading-assemblies"
+    description="The runtime delegates that start the runtime and load managed code."
+  />
+  <Card
+    title="Locating hostfxr"
+    href="/docs/guide/locating-hostfxr"
+    description="How hostfxr is discovered and loaded through nethost."
+  />
+  <Card
+    title="Error handling"
+    href="/docs/guide/error-handling"
+    description="The exception model and native status-code mapping."
+  />
+  <Card
+    title="API reference"
+    href="/docs/api-reference"
+    description="Every public type and member in HostFxrSharp."
+  />
+</Cards>

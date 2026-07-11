@@ -1,0 +1,12 @@
+{
+  "title": "Documentation",
+  "pages": [
+    "index",
+    "getting-started",
+    "concepts",
+    "guide",
+    "cross-platform",
+    "native-aot",
+    "api-reference"
+  ]
+}

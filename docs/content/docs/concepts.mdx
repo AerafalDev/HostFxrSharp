@@ -1,0 +1,305 @@
+---
+title: How hosting works
+description: nethost, hostfxr and hostpolicy, host contexts, and the single-runtime-per-process model.
+---
+
+Before you can run managed code, *something* native has to find the .NET runtime on the machine, load it, and hand control to it. That "something" is the set of **native hosting components** that ship with every .NET installation. HostFxrSharp is a thin, safe, and **Native-AOT-compatible** managed wrapper over those components — it does not reimplement them, it *drives* them.
+
+This page explains what the native components are, how the hosting pipeline flows through them, and how HostFxrSharp surfaces that flow as ordinary C#. If you just want to run an app, start with [Getting started](/docs/getting-started); this page is the mental model underneath it.
+
+## The native hosting components
+
+.NET's hosting stack is layered. Each layer has a single job and hands off to the next.
+
+### nethost — the locator
+
+`nethost` is a tiny helper library whose only job is to **find `hostfxr`** on the machine — resolving the correct install location, architecture, and version — and return its full path. It answers one question: *"Where is `hostfxr`?"* It does not load a runtime or run anything.
+
+In HostFxrSharp this is what [`HostFxr.EnsureLoaded`](/docs/guide/locating-hostfxr) uses under the hood to discover `hostfxr` before loading it. If you already know where `hostfxr` lives, you can skip `nethost` entirely with `HostFxr.LoadFrom(path)` — no `nethost` library need even be present.
+
+### hostfxr — the host resolver and API
+
+`hostfxr` (the "host framework resolver") is the real entry point. It resolves which shared frameworks and runtime version the app needs, locates `hostpolicy`, and exposes the public hosting **API**: initializing host contexts, reading and writing runtime properties, running an app, and requesting runtime delegates. Everything HostFxrSharp does at runtime is a call into `hostfxr`.
+
+### hostpolicy — the runtime policy
+
+`hostpolicy` is loaded by `hostfxr` and applies the **runtime policy**: it uses the resolved configuration to load `coreclr` (the runtime itself), set up assembly probing paths, apply the runtime properties, and ultimately start execution. You never call `hostpolicy` directly — it sits behind `hostfxr`.
+
+| Component    | Role                        | Answers                                   | HostFxrSharp surface                     |
+| ------------ | --------------------------- | ----------------------------------------- | ---------------------------------------- |
+| `nethost`    | Locator                     | *Where is `hostfxr`?*                      | `HostFxr.EnsureLoaded`                   |
+| `hostfxr`    | Host resolver + public API  | *Which runtime, and how do I start it?*   | `HostFxr`, `HostContext`                 |
+| `hostpolicy` | Runtime policy              | *Load `coreclr` and apply configuration.* | Indirect (driven through `hostfxr`)      |
+
+<Callout type="info">
+The status codes these components return are unified into a single [`HostStatusCode`](/docs/api-reference) enum, so a failure in any layer is reported the same structured way. See [Status codes and structured exceptions](#status-codes-and-structured-exceptions) below.
+</Callout>
+
+## The hosting pipeline
+
+Starting a runtime is a fixed sequence of stages. Each stage maps to one HostFxrSharp call (or is performed implicitly on your behalf):
+
+```text
+  +-------------+     +-------------+     +------------------+     +--------------+     +--------------------+
+  |   locate    | --> |    load     | --> |  initialize a    | --> |  start the   | --> |    run the app     |
+  |   hostfxr   |     |   hostfxr   |     |  host context    |     |   runtime    |     |  OR get a runtime  |
+  |  (nethost)  |     |             |     |    (hostfxr)     |     | (hostpolicy) |     |     delegate       |
+  +-------------+     +-------------+     +------------------+     +--------------+     +--------------------+
+        |                   |                     |                      |                       |
+ get_hostfxr_path    NativeLibrary.Load    hostfxr_initialize_*    (implicit on the        RunApp()  /
+     (nethost)                                                     first delegate or       GetRuntimeDelegate()
+                                                                   RunApp() call)
+```
+
+Mapped to the API:
+
+| Stage             | Native operation                      | HostFxrSharp                                                                  |
+| ----------------- | ------------------------------------- | ---------------------------------------------------------------------------- |
+| Locate `hostfxr`  | `get_hostfxr_path` (`nethost`)        | `HostFxr.EnsureLoaded` (or bypass with `HostFxr.LoadFrom`)                    |
+| Load `hostfxr`    | `LoadLibrary` / `dlopen`              | `HostFxr.EnsureLoaded` / `HostFxr.LoadFrom`                                   |
+| Initialize context| `hostfxr_initialize_for_*`            | `HostFxr.InitializeForCommandLine` / `HostFxr.InitializeForRuntimeConfig`     |
+| Start the runtime | first delegate / run                  | *Implicit* — happens on the first `RunApp` or `GetRuntimeDelegate`            |
+| Run the app       | `hostfxr_run_app`                     | `HostContext.RunApp`                                                          |
+| Get a delegate    | `hostfxr_get_runtime_delegate`        | `HostContext.GetRuntimeDelegate` and the typed loader helpers                |
+
+`HostFxr.EnsureLoaded` folds the first two stages together and is **idempotent and process-wide**: because a process can only ever load one `hostfxr`, only the first call actually locates and loads it, and only that first call's resolution options take effect. The initialize methods call it for you, so you rarely invoke it directly.
+
+### Running a full application
+
+The command-line path mirrors what `dotnet app.dll` does. Initialize a context from the command line, then run it — the runtime starts as part of `RunApp`, which blocks until the app exits and returns its exit code.
+
+<Steps>
+
+<Step>
+
+#### Initialize a host context from the command line
+
+Locating and loading `hostfxr` happen automatically here, then the first host context is initialized:
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Contexts;
+
+// locate + load hostfxr, then initialize the first host context
+using HostContext context = HostFxr.InitializeForCommandLine(["MyApp.dll", "--verbose"]);
+```
+
+</Step>
+
+<Step>
+
+#### Run the app
+
+Calling `RunApp` starts the runtime, blocks until the app exits, and returns its exit code:
+
+```csharp
+// starts the runtime and blocks until the app exits
+int exitCode = context.RunApp();
+
+Console.WriteLine($"App exited with code {exitCode}.");
+```
+
+</Step>
+
+</Steps>
+
+See [Running applications](/docs/guide/running-apps) for the full command-line story.
+
+### Loading into a runtime you control
+
+The runtime-config path is for *hosting* scenarios: you start the runtime from a `.runtimeconfig.json`, then reach into it to load assemblies and resolve function pointers to managed static methods. Requesting any runtime delegate is what starts the runtime:
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Contexts;
+
+using HostContext context = HostFxr.InitializeForRuntimeConfig("MyComponent.runtimeconfig.json");
+
+// requesting a delegate starts the runtime (hostpolicy loads coreclr here)
+var loader = context.GetAssemblyFunctionPointerLoader();
+// ... use `loader` to bind a native pointer to a managed static method
+```
+
+<Callout type="info">
+The runtime-config method **must** describe a framework-dependent component; a self-contained config is rejected. See [Loading assemblies](/docs/guide/loading-assemblies) for what the loader helpers do, and the [API reference](/docs/api-reference) for the full delegate list behind `GetRuntimeDelegate(HostFxrDelegateType)`.
+</Callout>
+
+## One runtime per process
+
+<Callout type="warn">
+The single most important rule in this stack: **only one .NET runtime can be loaded per process.** Everything about the API shape follows from it.
+</Callout>
+
+The **first** host context you initialize *owns* that runtime. Any context initialized afterward does not start a second runtime — it **attaches** to the one already running and becomes a **secondary** context. HostFxrSharp exposes this distinction directly through [`HostContext.Kind`](/docs/guide/host-contexts):
+
+```csharp
+using HostFxrSharp.Contexts;
+
+public enum HostContextKind
+{
+    First,      // this context loaded and owns the runtime
+    Secondary,  // this context attached to the already-loaded runtime
+}
+```
+
+The two initialize methods differ in how they interact with this rule:
+
+- **`InitializeForCommandLine`** can only *succeed once* per process. If a runtime is already loaded, it throws `RuntimeAlreadyLoadedException` — you cannot start an app on top of a runtime that already exists.
+- **`InitializeForRuntimeConfig`** may be called many times (and is safe to call concurrently from multiple threads). The first call gets a `First` context; later calls get `Secondary` contexts that share the running runtime.
+
+When a secondary context's `.runtimeconfig.json` requests runtime properties that differ from those already applied to the running runtime, the native layer returns a **non-fatal warning** (`SuccessDifferentRuntimeProperties`). The already-running runtime keeps its own values; the differing ones are simply ignored. HostFxrSharp surfaces this as `HostContext.RuntimePropertiesDiffer`, and you can enumerate exactly what diverged before deciding whether to proceed:
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Contexts;
+
+using HostContext context = HostFxr.InitializeForRuntimeConfig("Plugin.runtimeconfig.json");
+
+if (context.Kind is HostContextKind.Secondary && context.RuntimePropertiesDiffer)
+{
+    // properties this config wanted but that the running runtime does not honor
+    foreach (RuntimePropertyConflict conflict in context.GetConflictingRuntimeProperties())
+    {
+        // inspect the conflict and decide whether the divergence is acceptable
+        HandleDivergentProperty(conflict);
+    }
+}
+```
+
+<Callout type="warn">
+**Always dispose a host context.** The underlying native handle is wrapped in a `SafeHandle`, so `hostfxr_close` still runs even if you forget — but an *abandoned first context* can block future initializations at the native layer, so deterministic `using` disposal matters. A host context is also **not thread-safe**: call at most one method at a time on a given context (different contexts on different threads is fine).
+</Callout>
+
+More detail on the lifecycle lives in [Host contexts](/docs/guide/host-contexts).
+
+## Runtime properties become read-only
+
+While a context is being set up but *before the runtime has started*, you can read and write its runtime properties — the key/value pairs the runtime applies at startup (probing paths, feature switches, and so on). Once the runtime starts, those properties are frozen.
+
+<Callout type="warn">
+Requesting any runtime delegate or calling `RunApp` **starts the runtime and freezes its properties**. After that point, attempting to set a property throws `InvalidOperationException` ("Runtime properties cannot be modified after the runtime has started"). The workflow is always *configure, then start*.
+</Callout>
+
+Concretely, HostFxrSharp only allows modifying properties when **all** of these hold:
+
+1. the context is the **first** (runtime-owning) context — secondary contexts are always read-only, since they merely attach to an already-configured runtime; **and**
+2. the runtime has **not started** — requesting any runtime delegate or calling `RunApp` starts it; **and**
+3. the context has not been disposed.
+
+Attempting to set a property after the runtime has started throws `InvalidOperationException`, and attempting it on a secondary context throws as well. So the workflow is always *configure, then start*:
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Contexts;
+
+using HostContext context = HostFxr.InitializeForRuntimeConfig("MyComponent.runtimeconfig.json");
+
+// ... adjust context.Properties here, while the runtime is still stopped ...
+
+// starting the runtime freezes the properties from this point on
+var resolver = context.GetFunctionPointerResolver();
+```
+
+You can always *read* the active runtime's properties after start via the process-wide helpers, which operate on the first (active) context:
+
+```csharp
+using HostFxrSharp;
+
+if (HostFxr.TryGetActiveRuntimeProperty("APP_CONTEXT_BASE_DIRECTORY", out string? baseDir))
+    Console.WriteLine($"Base directory: {baseDir}");
+
+foreach (var (name, value) in HostFxr.GetActiveRuntimeProperties())
+    Console.WriteLine($"{name} = {value}");
+```
+
+See [Runtime properties](/docs/guide/runtime-properties) for the complete accessor API on `HostContext.Properties`.
+
+## Status codes and structured exceptions
+
+The native components communicate results through integer status codes (mirrored from the runtime's `error_codes.h`). HostFxrSharp reads every native return value into the strongly-typed [`HostStatusCode`](/docs/api-reference) enum and, on the happy path, **never surfaces a raw code** — failures become specific exceptions in the `HostFxrSharp.Exceptions` namespace, while the raw code remains available on `HostingException.StatusCode` for structured decisions.
+
+Classification is by sign: `0`, `1`, and `2` are successes (the extension helpers `IsSuccess()` and `IsFailure()` encode this), and the high-bit `0x8xxxxxxx` values are failures. The three success codes carry meaning:
+
+| Status code                        | Value | Meaning                                                                 |
+| ---------------------------------- | ----- | ----------------------------------------------------------------------- |
+| `Success`                          | `0`   | Operation succeeded; a `First` context.                                 |
+| `SuccessHostAlreadyInitialized`    | `1`   | Attached to a running runtime — a `Secondary` context.                  |
+| `SuccessDifferentRuntimeProperties`| `2`   | Secondary context **warning**: requested properties diverge and are ignored. |
+
+Representative failures and how they map:
+
+| Status code                 | Surfaced as                          | Typical cause                                                   |
+| --------------------------- | ------------------------------------ | -------------------------------------------------------------- |
+| `CoreHostLibMissingFailure` | `HostingException`                   | A required hosting library could not be found.                 |
+| `FrameworkMissingFailure`   | `HostingException`                   | The required shared framework is not installed.                |
+| `InvalidConfigFile`         | `HostingException`                   | The `.runtimeconfig.json` is malformed.                        |
+| `HostPropertyNotFound`      | `RuntimePropertyNotFoundException`   | A requested runtime property does not exist.                   |
+| `HostApiUnsupportedScenario`| `UnsupportedHostingScenarioException`| The scenario/delegate is not supported for this context.       |
+| `HostApiUnsupportedVersion` | `IncompatibleHostPolicyException`    | A newer `hostfxr` API was invoked against an older `hostpolicy`.|
+
+Because loading and initialization are distinct stages, you can catch failures at the granularity you care about:
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Contexts;
+using HostFxrSharp.Exceptions;
+
+try
+{
+    using HostContext context = HostFxr.InitializeForCommandLine(["MyApp.dll"]);
+    Environment.Exit(context.RunApp());
+}
+catch (HostFxrNotFoundException)
+{
+    Console.Error.WriteLine("Could not locate hostfxr — is the .NET runtime installed?");
+}
+catch (RuntimeAlreadyLoadedException)
+{
+    Console.Error.WriteLine("A runtime is already loaded; RunApp needs the first context.");
+}
+catch (HostingException ex)
+{
+    // the raw native code is still available for structured handling
+    Console.Error.WriteLine($"Hosting failed: {ex.StatusCode} — {ex.Message}");
+}
+```
+
+For diagnostics *below* the exception layer, install a process-wide error writer to capture the raw messages the hosting components emit. The registration removes the writer when disposed:
+
+```csharp
+using HostFxrSharp;
+
+using IDisposable writer = HostFxr.SetErrorWriter(
+    message => Console.Error.WriteLine($"[hostfxr] {message}"));
+```
+
+The full mapping table and exception hierarchy are documented in [Error handling](/docs/guide/error-handling).
+
+## AOT and the char_t design
+
+Two design choices run through the whole wrapper.
+
+### Native-AOT friendliness
+
+Every native call goes through source-generated P/Invokes and unmanaged function pointers rather than runtime marshalling or reflection, so nothing is trimmed away or JIT-generated at startup. The only managed-to-native *callback* — the error writer above — is routed through a static `[UnmanagedCallersOnly]` trampoline rather than a marshalled delegate. The result is that the entire surface is Native-AOT compatible; you can publish a host that has no JIT of its own and still start a full runtime. See [Native AOT](/docs/native-aot) for publishing guidance.
+
+### char_t marshalling
+
+The hosting components speak the platform's native character type, `char_t`, and HostFxrSharp handles that conversion for every string it passes across the boundary, so you always work with ordinary .NET `string` values and never think about encoding.
+
+<Callout type="info">
+`char_t` is **UTF-16 on Windows and UTF-8 on Unix**. HostFxrSharp converts each string to the correct native encoding on the way out and copies native property-value pointers into managed strings *before* return — honoring the native rule that such pointers are only valid until the next run/close/set call. The cross-platform details are covered in [Cross-platform](/docs/cross-platform).
+</Callout>
+
+## Where to go next
+
+<Cards>
+  <Card title="Getting started" href="/docs/getting-started" description="Run your first app end to end." />
+  <Card title="Locating hostfxr" href="/docs/guide/locating-hostfxr" description="nethost discovery vs. explicit LoadFrom." />
+  <Card title="Host contexts" href="/docs/guide/host-contexts" description="First vs. secondary contexts and their lifecycle." />
+  <Card title="Runtime properties" href="/docs/guide/runtime-properties" description="Read and write properties before start." />
+  <Card title="Running applications" href="/docs/guide/running-apps" description="The command-line hosting path." />
+  <Card title="Loading assemblies" href="/docs/guide/loading-assemblies" description="Runtime delegates and the loader helpers." />
+  <Card title="Error handling" href="/docs/guide/error-handling" description="The full status-code-to-exception mapping." />
+  <Card title="API reference" href="/docs/api-reference" description="Every public type and member." />
+</Cards>

@@ -1,0 +1,392 @@
+---
+title: Error handling
+description: The exception hierarchy, status codes, and the diagnostic error writer.
+---
+
+The native hosting components (`nethost`, `hostfxr`, `hostpolicy`) communicate failure through
+integer status codes and, optionally, free-form diagnostic text. HostFxrSharp never surfaces a raw
+status code on the happy path. Instead, every failure arrives as a strongly-typed exception derived
+from `HostingException`, and — where the failure originated in a native call — the originating
+[`HostStatusCode`](#status-codes-hoststatuscode) is preserved on the exception for diagnostics.
+
+This page covers the exception hierarchy, the status-code enum and its classification helpers,
+recommended `try`/`catch` patterns, and the process-wide diagnostic error writer.
+
+All exception types live in the `HostFxrSharp.Exceptions` namespace; `HostStatusCode`, the
+`HostFxr` entry point, and the `HostErrorWriter` delegate live in `HostFxrSharp`.
+
+## The exception hierarchy
+
+Every failure raised by the library derives from the abstract `HostingException`, which in turn
+derives from `System.Exception`:
+
+```text
+System.Exception
+└── HostingException                        (abstract; StatusCode)
+    ├── HostFxrNotFoundException            (sealed)
+    ├── HostFxrResolutionException          (sealed)
+    └── HostingApiException                 (carries a HostStatusCode)
+        ├── HostInvalidStateException           (sealed)
+        ├── IncompatibleHostPolicyException     (sealed)
+        ├── RuntimeAlreadyLoadedException       (sealed)
+        ├── RuntimePropertyNotFoundException    (sealed; PropertyName)
+        └── UnsupportedHostingScenarioException (sealed)
+```
+
+Two failure families sit directly under `HostingException`:
+
+- **Resolution failures** — `HostFxrNotFoundException` and `HostFxrResolutionException` — happen
+  while locating and loading the `hostfxr` library itself, before any host context exists. See
+  [Locating hostfxr](/docs/guide/locating-hostfxr).
+- **API failures** — everything under `HostingApiException` — come from a native hosting call and
+  therefore carry a `HostStatusCode`.
+
+### `HostingException` (base)
+
+`HostingException` is abstract, so you never construct or catch it directly by instantiation — you
+catch it as the common base of every library-specific failure. It exposes a single member beyond
+`System.Exception`:
+
+```csharp
+namespace HostFxrSharp.Exceptions;
+
+public abstract class HostingException : Exception
+{
+    // The originating native status code, when the failure came from a native call; otherwise null.
+    public HostStatusCode? StatusCode { get; }
+}
+```
+
+<Callout type="info">
+  `StatusCode` is nullable. Resolution failures and failures that do not originate from a native
+  call may leave it `null`, so always null-check it before formatting.
+</Callout>
+
+### When each subtype is thrown
+
+| Exception | Base | When it is thrown |
+| --- | --- | --- |
+| `HostFxrNotFoundException` | `HostingException` | `nethost` could not locate `hostfxr` at all — no compatible .NET installation is present, and no `nethost.dll` ships with the app. Raised from `HostFxr.EnsureLoaded` (and therefore from the first `Initialize…` call). |
+| `HostFxrResolutionException` | `HostingException` | `hostfxr` was located but could not be resolved or loaded for a non "not-found" reason — for example a wrong-architecture binary (`BadImageFormatException`) or a missing dependency (`DllNotFoundException`). Raised from `HostFxr.EnsureLoaded` and `HostFxr.LoadFrom`; the underlying load error is preserved on `InnerException`. |
+| `HostingApiException` | `HostingException` | A general native hosting-call failure that does not map to a more specific subtype below. `StatusCode` carries the originating `HostStatusCode`. |
+| `HostInvalidStateException` | `HostingApiException` | The native call reported `HostInvalidState` (`0x800080a3`) — the operation is invalid in the current host state (for example, mutating a context after its runtime has started). |
+| `IncompatibleHostPolicyException` | `HostingApiException` | A newer `hostfxr` API was invoked against an older `hostpolicy` that does not implement it — native `HostApiUnsupportedVersion` (`0x800080a2`). |
+| `RuntimeAlreadyLoadedException` | `HostingApiException` | An operation requires that no runtime be loaded, but one already is — for example a second `HostFxr.InitializeForCommandLine` in a process (only one runtime can exist per process). |
+| `RuntimePropertyNotFoundException` | `HostingApiException` | A requested runtime property does not exist — native `HostPropertyNotFound` (`0x800080a4`). Exposes the missing `PropertyName` when known. |
+| `UnsupportedHostingScenarioException` | `HostingApiException` | The requested scenario is not supported for the given host context — native `HostApiUnsupportedScenario` (`0x800080a6`), e.g. requesting an incompatible runtime delegate. |
+
+`RuntimePropertyNotFoundException` additionally carries the name of the property that could not be
+found and provides a factory for it:
+
+```csharp
+namespace HostFxrSharp.Exceptions;
+
+public sealed class RuntimePropertyNotFoundException : HostingApiException
+{
+    public string? PropertyName { get; init; }
+
+    public static RuntimePropertyNotFoundException ForProperty(string propertyName);
+}
+```
+
+<Callout type="info">
+  Argument validation uses the standard base-class-library exceptions, **not** the
+  `HostingException` hierarchy. Passing `null` for `args`, or an empty `runtimeConfigPath`, throws
+  `ArgumentNullException` / `ArgumentException` — catch those separately (or, better, avoid them by
+  validating input up front).
+</Callout>
+
+## Status codes: `HostStatusCode`
+
+`HostStatusCode` mirrors the native `StatusCode` enum from the runtime's `error_codes.h`. Successes
+are non-negative; failures use the high-bit `0x8xxxxxxx` range (negative when viewed as `int`):
+
+| Code | Value | Meaning |
+| --- | --- | --- |
+| `Success` | `0` | The operation succeeded. |
+| `SuccessHostAlreadyInitialized` | `1` | Attached to an already-initialized runtime — a **secondary** host context. |
+| `SuccessDifferentRuntimeProperties` | `2` | Secondary context created, but its config specifies properties that differ from the running runtime. A **warning**: the context is usable, but the differing properties are ignored. |
+| `InvalidConfigFile` | `0x80008093` | The `.runtimeconfig.json` is invalid. |
+| `FrameworkMissingFailure` | `0x80008096` | A required shared framework is missing. |
+| `HostApiUnsupportedVersion` | `0x800080a2` | New `hostfxr` API against older `hostpolicy` → `IncompatibleHostPolicyException`. |
+| `HostInvalidState` | `0x800080a3` | Operation invalid in the current host state → `HostInvalidStateException`. |
+| `HostPropertyNotFound` | `0x800080a4` | Requested runtime property does not exist → `RuntimePropertyNotFoundException`. |
+| `HostApiUnsupportedScenario` | `0x800080a6` | Scenario not supported for this context → `UnsupportedHostingScenarioException`. |
+
+The table is representative, not exhaustive — `HostStatusCode` also defines the full set of resolver,
+bind, and init failure codes from `error_codes.h`. You normally never see a raw code: it is exposed
+only for diagnostics, through `HostingException.StatusCode`.
+
+### Classifying a status code
+
+`HostingStatusCodeExtensions` adds three convenience checks over any `HostStatusCode`:
+
+| Member | Returns `true` when |
+| --- | --- |
+| `IsSuccess()` | The code is a success or warning (`0`, `1`, or `2`). |
+| `IsFailure()` | The code is a failure (`0x8xxxxxxx`). |
+| `IsSecondaryContext()` | The code is `SuccessHostAlreadyInitialized` or `SuccessDifferentRuntimeProperties`. |
+
+```csharp
+using HostFxrSharp;
+
+void Describe(HostStatusCode code)
+{
+    if (code.IsFailure())
+    {
+        Console.Error.WriteLine($"Hosting failed: {code}");
+        return;
+    }
+
+    if (code.IsSecondaryContext())
+        Console.WriteLine("Attached to an already-running runtime (secondary context).");
+    else
+        Console.WriteLine("Initialized the process runtime (first context).");
+}
+```
+
+Because `IsSuccess()` treats `SuccessDifferentRuntimeProperties` as success, use
+`IsSecondaryContext()` (or inspect a [host context](/docs/guide/host-contexts)'s `Kind` /
+`RuntimePropertiesDiffer`) when you need to react to the divergent-properties warning specifically.
+
+### How status codes map to exceptions
+
+When a native call fails, the code is translated into the most specific exception type available;
+anything without a dedicated subtype becomes a general `HostingApiException`:
+
+| `HostStatusCode` | Exception thrown |
+| --- | --- |
+| `HostApiUnsupportedVersion` | `IncompatibleHostPolicyException` |
+| `HostInvalidState` | `HostInvalidStateException` |
+| `HostPropertyNotFound` | `RuntimePropertyNotFoundException` |
+| `HostApiUnsupportedScenario` | `UnsupportedHostingScenarioException` |
+| any other failure code | `HostingApiException` (with `StatusCode` set) |
+
+## Catching hosting failures
+
+Because the hierarchy is layered, order your `catch` clauses **most specific first** and let
+`HostingException` act as the catch-all. This example covers the full lifecycle — locating `hostfxr`,
+initializing the process runtime, and running an app:
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Contexts;
+using HostFxrSharp.Exceptions;
+
+static int RunApp(string[] args)
+{
+    try
+    {
+        // Loads hostfxr on first use, then initializes the process runtime for a managed app.
+        using HostContext app = HostFxr.InitializeForCommandLine(args);
+        return app.RunApp();
+    }
+    catch (HostFxrNotFoundException)
+    {
+        // nethost could not locate hostfxr — no compatible .NET install found.
+        Console.Error.WriteLine("No compatible .NET runtime was found on this machine.");
+        return 87;
+    }
+    catch (HostFxrResolutionException ex)
+    {
+        // hostfxr was found but could not be loaded (e.g. wrong architecture).
+        Console.Error.WriteLine($"Failed to load hostfxr: {ex.Message}");
+        return 88;
+    }
+    catch (RuntimeAlreadyLoadedException)
+    {
+        // Only one runtime can be loaded per process.
+        Console.Error.WriteLine("A .NET runtime is already loaded in this process.");
+        return 89;
+    }
+    catch (HostingException ex)
+    {
+        // Any other hosting failure. StatusCode carries the native code when available.
+        Console.Error.WriteLine($"Hosting failed ({ex.StatusCode?.ToString() ?? "n/a"}): {ex.Message}");
+        return 1;
+    }
+}
+```
+
+`HostFxrNotFoundException` and `HostFxrResolutionException` are siblings (both derive directly from
+`HostingException`), so their relative order does not matter — but both must precede the
+`HostingException` catch-all.
+
+### Inspecting the native status code
+
+For failures that come from a native call, catch `HostingApiException` and branch on `StatusCode`. A
+`when` filter keeps the handler focused on codes you actually recognize:
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Exceptions;
+
+try
+{
+    using var component = HostFxr.InitializeForRuntimeConfig("MyComponent.runtimeconfig.json");
+    // ... use the component context ...
+}
+catch (HostingApiException ex) when (ex.StatusCode == HostStatusCode.FrameworkMissingFailure)
+{
+    Console.Error.WriteLine("A required shared framework is missing. Install the matching .NET runtime.");
+}
+catch (HostingApiException ex) when (ex.StatusCode == HostStatusCode.InvalidConfigFile)
+{
+    Console.Error.WriteLine("The .runtimeconfig.json is invalid.");
+}
+catch (HostingApiException ex)
+{
+    Console.Error.WriteLine($"Hosting API failed: {ex.StatusCode} — {ex.Message}");
+}
+```
+
+<Callout type="info">
+  Not every "missing" condition is an exception. `HostFxr.TryGetActiveRuntimeProperty` returns
+  `false` (rather than throwing `RuntimePropertyNotFoundException`) when the property does not exist,
+  and only throws for genuine failures. Reserve `try`/`catch` for operations that have no `Try…`
+  counterpart. See [Runtime properties](/docs/guide/runtime-properties).
+</Callout>
+
+## The diagnostic error writer
+
+The native hosting components can emit free-form diagnostic text explaining *why* a call failed —
+detail that is far richer than the status code alone. `HostFxr.SetErrorWriter` installs a
+process-wide callback to capture that text. It is the single managed-to-native callback in the
+library, and it is [Native-AOT](/docs/native-aot) safe.
+
+The callback signature is the `HostErrorWriter` delegate:
+
+```csharp
+namespace HostFxrSharp;
+
+public delegate void HostErrorWriter(string message);
+```
+
+Install a writer and route its messages to your logger or console. `SetErrorWriter` returns an
+`IDisposable` — disposing it removes the writer, so a `using` block scopes the diagnostics to the
+region where you need them:
+
+```csharp
+using HostFxrSharp;
+using HostFxrSharp.Exceptions;
+
+// Capture host diagnostics for the duration of the initialize/run sequence.
+using (HostFxr.SetErrorWriter(message => Console.Error.WriteLine($"[hostfxr] {message}")))
+{
+    try
+    {
+        using var app = HostFxr.InitializeForCommandLine(["MyApp.dll"]);
+        return app.RunApp();
+    }
+    catch (HostingException ex)
+    {
+        // The error writer has already emitted the native diagnostic detail for this failure;
+        // ex.StatusCode + ex.Message give the structured view on top of it.
+        Console.Error.WriteLine($"Initialization failed: {ex.Message}");
+        return 1;
+    }
+}
+// The writer is removed here, when the registration is disposed.
+```
+
+### Behavior and rules
+
+- **Process-global, most recent wins.** The native error writer is a single process-wide slot.
+  Calling `SetErrorWriter` again replaces the current writer; there is only ever one active writer
+  per process.
+- **Dispose to remove.** Disposing the returned registration clears the current writer, so the
+  hosting components stop routing messages to managed code. Disposal is idempotent.
+- **Implicit load.** `SetErrorWriter` calls `EnsureLoaded` internally, so it can throw
+  `HostFxrNotFoundException` or `HostFxrResolutionException` if `hostfxr` cannot be located or
+  loaded.
+- **`null` is rejected.** Passing a `null` writer throws `ArgumentNullException`.
+
+<Callout type="warn">
+  **Do not throw from the writer.** The callback runs on the native → managed boundary, where
+  propagating a managed exception is undefined. Any exception your writer throws is caught and
+  swallowed by the trampoline, so keep the callback simple and non-throwing (log, don't fail).
+</Callout>
+
+<Callout type="info">
+  **Native-AOT.** The writer is dispatched through a static `[UnmanagedCallersOnly]` (`Cdecl`)
+  trampoline and an unmanaged function pointer — there is no runtime-generated marshalling thunk — so
+  installing an error writer is fully compatible with `PublishAot=true`. See
+  [Native AOT](/docs/native-aot).
+</Callout>
+
+<Callout type="info">
+  **`char_t` encoding.** The native message is a `char_t` string — UTF-16 on Windows, UTF-8 on
+  Unix — but the trampoline decodes it per platform, so your `HostErrorWriter` always receives an
+  ordinary managed `string`. See [Cross-platform](/docs/cross-platform).
+</Callout>
+
+## Putting it together
+
+A robust hosting entry point combines the pieces above into one sequence.
+
+<Steps>
+
+<Step>
+
+**Install a diagnostic writer** so native detail is captured for the whole init/run region, and
+scope it with `using` so it is removed on exit.
+
+```csharp
+using (HostFxr.SetErrorWriter(m => logger.LogWarning("[hostfxr] {Message}", m)))
+{
+    // ...
+}
+```
+
+</Step>
+
+<Step>
+
+**Wrap initialization and run in `try`/`catch`, ordered most specific first**, letting
+`HostingException` be the catch-all. Handle `HostFxrNotFoundException`, `HostFxrResolutionException`,
+and `RuntimeAlreadyLoadedException` before the base type.
+
+</Step>
+
+<Step>
+
+**Inspect `StatusCode` where it matters** by catching `HostingApiException` and branching on
+recognized codes with `when` filters (for example `FrameworkMissingFailure` or `InvalidConfigFile`).
+Always null-check `StatusCode` before formatting.
+
+</Step>
+
+<Step>
+
+**Let the `using` dispose the writer** as the region exits, restoring the process to having no
+active error writer.
+
+</Step>
+
+</Steps>
+
+## Summary
+
+- All library failures derive from `HostingException`; catch it as the common base and order more
+  specific subtypes first.
+- Native-call failures are `HostingApiException`s (or one of its sealed subtypes) and carry a
+  `HostStatusCode` on `StatusCode` — always null-check it.
+- Use `HostStatusCode`'s `IsSuccess()` / `IsFailure()` / `IsSecondaryContext()` helpers to classify
+  a code without touching raw integers.
+- Install `HostFxr.SetErrorWriter` to capture rich native diagnostic text; dispose the returned
+  registration to remove it.
+
+## See also
+
+<Cards>
+  <Card title="Getting started" href="/docs/getting-started" description="An end-to-end walkthrough of loading hostfxr and running an app." />
+  <Card title="How hosting works" href="/docs/concepts" description="The model behind nethost, hostfxr, and host contexts." />
+  <Card title="Locating hostfxr" href="/docs/guide/locating-hostfxr" description="Where resolution failures come from and how to override discovery." />
+  <Card title="Host contexts" href="/docs/guide/host-contexts" description="First vs. secondary contexts and their lifetimes." />
+  <Card title="Runtime properties" href="/docs/guide/runtime-properties" description="Try… accessors versus throwing ones, and read-only-after-start rules." />
+  <Card title="Running applications" href="/docs/guide/running-apps" description="Initialize for the command line and run a managed app." />
+  <Card title="Loading assemblies" href="/docs/guide/loading-assemblies" description="Get typed delegates into a component via a runtime config." />
+  <Card title="Native AOT" href="/docs/native-aot" description="Why the whole surface is PublishAot-friendly." />
+  <Card title="Cross-platform" href="/docs/cross-platform" description="char_t encoding and per-platform behavior." />
+  <Card title="API reference" href="/docs/api-reference" description="Every public type and member." />
+</Cards>
