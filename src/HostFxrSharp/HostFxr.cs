@@ -1,4 +1,5 @@
-﻿using System.Runtime.CompilerServices;
+﻿using System.Diagnostics.CodeAnalysis;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using HostFxrSharp.Contexts;
 using HostFxrSharp.Exceptions;
@@ -144,7 +145,7 @@ public static class HostFxr
     /// <returns><see langword="true"/> if the property exists; otherwise <see langword="false"/>.</returns>
     /// <exception cref="ArgumentException"><paramref name="name"/> is <see langword="null"/> or empty.</exception>
     /// <remarks>Operates on the active context (native <c>host_context_handle == NULL</c>); requires a loaded runtime.</remarks>
-    public static bool TryGetActiveRuntimeProperty(string name, out string? value)
+    public static bool TryGetActiveRuntimeProperty(string name, [NotNullWhen(true)] out string? value)
     {
         ArgumentException.ThrowIfNullOrEmpty(name);
 
@@ -152,7 +153,7 @@ public static class HostFxr
         var code = (HostStatusCode)rc;
 
         if (code.IsSuccess())
-            return true;
+            return value is not null;
 
         if (code is HostStatusCode.HostPropertyNotFound)
         {
