@@ -71,16 +71,17 @@ public sealed class ActiveRuntimePropertiesTests
         {
             HostFxr.EnsureLoaded();
 
-            // TPA is a long, semicolon-separated list of assembly paths. A correct char_t decode reproduces every
-            // separator and path intact, so this is a strong end-to-end decode check on a large real-world string.
+            // TPA is a long list of assembly paths joined by the platform path separator (';' on Windows, ':' on
+            // Unix). A correct char_t decode reproduces every separator and path intact, so this is a strong
+            // end-to-end decode check on a large real-world string.
             var found = HostFxr.TryGetActiveRuntimeProperty(TrustedPlatformAssemblies, out var tpa);
 
             found.ShouldBeTrue();
             tpa.ShouldNotBeNull();
 
             tpa.ShouldNotBeEmpty();
-            tpa.ShouldContain(";");
-            tpa.Split(';', StringSplitOptions.RemoveEmptyEntries).Length.ShouldBeGreaterThan(1);
+            tpa.ShouldContain(Path.PathSeparator);
+            tpa.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries).Length.ShouldBeGreaterThan(1);
             tpa.ShouldNotContain('\0');
             tpa.ShouldNotContain('�');
         }
