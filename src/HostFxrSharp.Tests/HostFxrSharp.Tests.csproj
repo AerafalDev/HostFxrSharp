@@ -1,0 +1,32 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="Xunit.SkippableFact" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+    <PackageReference Include="coverlet.collector" />
+    <PackageReference Include="Shouldly" />
+    <PackageReference Include="CsCheck" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\HostFxrSharp\HostFxrSharp.csproj" />
+    <ProjectReference Include="..\HostFxrSharp.TestComponent\HostFxrSharp.TestComponent.csproj" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <Target Name="CopyTestComponent" AfterTargets="Build">
+    <ItemGroup>
+      <_TestComponentFiles Include="$(MSBuildThisFileDirectory)..\HostFxrSharp.TestComponent\bin\$(Configuration)\net10.0\HostFxrSharp.TestComponent.*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_TestComponentFiles)"
+          DestinationFolder="$(OutDir)TestComponent"
+          SkipUnchangedFiles="true" />
+  </Target>
+
+</Project>

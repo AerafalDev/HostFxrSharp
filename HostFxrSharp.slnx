@@ -1,6 +1,7 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/HostFxrSharp.TestComponent/HostFxrSharp.TestComponent.csproj" />
+    <Project Path="src/HostFxrSharp.Tests/HostFxrSharp.Tests.csproj" />
     <Project Path="src/HostFxrSharp/HostFxrSharp.csproj" />
   </Folder>
 </Solution>
