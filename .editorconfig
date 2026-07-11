@@ -1,0 +1,50 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = crlf
+indent_style = space
+indent_size = 4
+tab_width = 4
+trim_trailing_whitespace = true
+insert_final_newline = true
+max_line_length = 180
+
+[*.md]
+max_line_length = off
+trim_trailing_whitespace = false
+
+[*.{json,jsonc,yml,yaml,toml}]
+indent_size = 2
+tab_width = 2
+
+[*.{xml,csproj,props,targets,resx,config}]
+indent_size = 2
+tab_width = 2
+
+[*.{sln,slnx}]
+end_of_line = crlf
+indent_style = space
+indent_size = 4
+insert_final_newline = false
+
+[*.cs]
+indent_size = 4
+tab_width = 4
+
+# Analyzer suppressions: rules that clash with this library's deliberate design
+# (native-interop naming, e.g. HostFxrDelegateType / nint-style members).
+dotnet_diagnostic.CA1711.severity = none
+dotnet_diagnostic.CA1708.severity = none
+dotnet_diagnostic.CA1720.severity = none
+
+# This library uses explicit constructors, never C# primary constructors.
+csharp_style_prefer_primary_constructors = false
+dotnet_diagnostic.IDE0290.severity = none
+
+# Test projects: xunit conventions clash with a couple of naming/design rules.
+[src/*.Tests/**.cs]
+dotnet_diagnostic.CA1707.severity = none
+
+[*.{g.cs,generated.cs}]
+generated_code = true
