@@ -21,13 +21,13 @@
   </PropertyGroup>
 
   <PropertyGroup>
-    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
-    <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
+    <Product>HostFxrSharp</Product>
+    <Authors>Aerafal</Authors>
+    <Company>Aerafal</Company>
+    <Copyright>Copyright (c) 2026 Aerafal</Copyright>
   </PropertyGroup>
 
   <PropertyGroup>
-    <Authors>Aerafal</Authors>
-    <Copyright>Copyright (c) 2026 Aerafal</Copyright>
     <PackageProjectUrl>https://github.com/AerafalDev/HostFxrSharp</PackageProjectUrl>
     <RepositoryUrl>https://github.com/AerafalDev/HostFxrSharp.git</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
