@@ -1,4 +1,5 @@
 export const appName = 'HostFxrSharp';
+export const basePath = process.env.DOCS_BASE_PATH ?? '/HostFxrSharp';
 export const docsRoute = '/docs';
 export const docsImageRoute = '/og/docs';
 export const docsContentRoute = '/llms.mdx/docs';
