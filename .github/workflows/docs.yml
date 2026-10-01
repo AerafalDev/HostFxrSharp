@@ -1,55 +1,80 @@
-name: Deploy docs
+name: Docs
 
 on:
   push:
     branches: [main]
     paths:
-      - 'docs/**'
-      - '.github/workflows/docs.yml'
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
+    name: Build
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: docs
-    steps:
-      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v7
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
           cache-dependency-path: docs/package-lock.json
 
-      - run: npm ci
+      - name: Install
+        run: npm ci
 
-      - run: npm run build
+      - name: Lint
+        run: npm run lint
+
+      - name: Type-check
+        run: npm run types:check
+
+      - name: Build
+        run: npm run build
         env:
           DOCS_BASE_PATH: /HostFxrSharp
 
-      - run: touch out/.nojekyll
+      - name: Disable Jekyll
+        run: touch out/.nojekyll
 
-      - uses: actions/upload-pages-artifact@v5
+      - name: Upload Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v5
         with:
           path: docs/out
 
   deploy:
+    name: Deploy
+    if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+
     steps:
-      - id: deployment
+      - name: Deploy to GitHub Pages
+        id: deployment
         uses: actions/deploy-pages@v5
