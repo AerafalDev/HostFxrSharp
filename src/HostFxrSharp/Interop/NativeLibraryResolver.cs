@@ -6,13 +6,26 @@ namespace HostFxrSharp.Interop;
 
 internal static class NativeLibraryResolver
 {
+    private static readonly Lock InstallLock = new();
+
     private static nint _hostFxrHandle;
-    private static int _installed;
+    private static bool _installed;
 
     internal static void EnsureInstalled()
     {
-        if (Interlocked.Exchange(ref _installed, 1) is 0)
+        if (Volatile.Read(ref _installed))
+            return;
+
+        // The flag is only published once the resolver is registered: a concurrent caller must never
+        // observe "installed" and P/Invoke into nethost while the default probing is still in effect.
+        lock (InstallLock)
+        {
+            if (_installed)
+                return;
+
             NativeLibrary.SetDllImportResolver(typeof(NativeLibraryResolver).Assembly, Resolve);
+            Volatile.Write(ref _installed, true);
+        }
     }
 
     internal static void SetHostFxrHandle(nint handle)
