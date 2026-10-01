@@ -131,7 +131,7 @@ internal static class NativeLibraryResolver
         return $"{os}-{arch}";
     }
 
-    private static IEnumerable<string> GetRidCandidates()
+    internal static IEnumerable<string> GetRidCandidates()
     {
         var rid = GetRid();
 
@@ -139,5 +139,12 @@ internal static class NativeLibraryResolver
 
         if (OperatingSystem.IsLinux())
             yield return rid.Replace("linux-", "linux-musl-", StringComparison.Ordinal);
+
+        // Source-built runtimes shipped by Linux distributions report a distro-specific RID (e.g. arch-x64),
+        // which is also the RID their app host pack is published under.
+        var runtimeRid = RuntimeInformation.RuntimeIdentifier;
+
+        if (!string.Equals(runtimeRid, rid, StringComparison.Ordinal) && !runtimeRid.Contains("-musl-", StringComparison.Ordinal))
+            yield return runtimeRid;
     }
 }
