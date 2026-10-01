@@ -127,6 +127,27 @@ public sealed class NativeLibraryResolverTests
         }
     }
 
+    [Fact]
+    public void GetRidCandidatesStartWithPortableRid()
+    {
+        NativeLibraryResolver.GetRidCandidates().First().ShouldBe(NativeLibraryResolver.GetRid());
+    }
+
+    [Fact]
+    public void GetRidCandidatesIncludeRuntimeIdentifier()
+    {
+        // Covers source-built distro runtimes (e.g. arch-x64), whose app host pack uses the runtime's own RID.
+        NativeLibraryResolver.GetRidCandidates().ShouldContain(RuntimeInformation.RuntimeIdentifier);
+    }
+
+    [Fact]
+    public void GetRidCandidatesHaveNoDuplicates()
+    {
+        var candidates = NativeLibraryResolver.GetRidCandidates().ToList();
+
+        candidates.ShouldBeUnique();
+    }
+
     private static string ExpectedNativeLibraryFileName(string baseName)
     {
         if (OperatingSystem.IsWindows())

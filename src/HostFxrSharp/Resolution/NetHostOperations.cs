@@ -26,8 +26,15 @@ internal static unsafe class NetHostOperations
                 var used = capacityUnits;
                 int rc;
 
-                fixed (byte* buf = buffer)
-                    rc = NativeHostingApi.GetHostFxrPath(buf, ref used, assemblyPath, dotnetRoot);
+                try
+                {
+                    fixed (byte* buf = buffer)
+                        rc = NativeHostingApi.GetHostFxrPath(buf, ref used, assemblyPath, dotnetRoot);
+                }
+                catch (DllNotFoundException ex)
+                {
+                    throw new HostFxrNotFoundException("The nethost library could not be loaded, so hostfxr cannot be located. Ship nethost with the application or install the .NET app host pack.", ex);
+                }
 
                 var code = (HostStatusCode)rc;
 

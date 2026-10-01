@@ -6,13 +6,26 @@ namespace HostFxrSharp.Interop;
 
 internal static class NativeLibraryResolver
 {
+    private static readonly Lock InstallLock = new();
+
     private static nint _hostFxrHandle;
-    private static int _installed;
+    private static bool _installed;
 
     internal static void EnsureInstalled()
     {
-        if (Interlocked.Exchange(ref _installed, 1) is 0)
+        if (Volatile.Read(ref _installed))
+            return;
+
+        // The flag is only published once the resolver is registered: a concurrent caller must never
+        // observe "installed" and P/Invoke into nethost while the default probing is still in effect.
+        lock (InstallLock)
+        {
+            if (_installed)
+                return;
+
             NativeLibrary.SetDllImportResolver(typeof(NativeLibraryResolver).Assembly, Resolve);
+            Volatile.Write(ref _installed, true);
+        }
     }
 
     internal static void SetHostFxrHandle(nint handle)
@@ -118,7 +131,7 @@ internal static class NativeLibraryResolver
         return $"{os}-{arch}";
     }
 
-    private static IEnumerable<string> GetRidCandidates()
+    internal static IEnumerable<string> GetRidCandidates()
     {
         var rid = GetRid();
 
@@ -126,5 +139,12 @@ internal static class NativeLibraryResolver
 
         if (OperatingSystem.IsLinux())
             yield return rid.Replace("linux-", "linux-musl-", StringComparison.Ordinal);
+
+        // Source-built runtimes shipped by Linux distributions report a distro-specific RID (e.g. arch-x64),
+        // which is also the RID their app host pack is published under.
+        var runtimeRid = RuntimeInformation.RuntimeIdentifier;
+
+        if (!string.Equals(runtimeRid, rid, StringComparison.Ordinal) && !runtimeRid.Contains("-musl-", StringComparison.Ordinal))
+            yield return runtimeRid;
     }
 }
