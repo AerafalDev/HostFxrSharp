@@ -3,6 +3,7 @@ using HostFxrSharp.Exceptions;
 using HostFxrSharp.Loading;
 using Shouldly;
 using Xunit;
+using Xunit.Sdk;
 
 namespace HostFxrSharp.Tests;
 
@@ -27,7 +28,7 @@ public sealed unsafe class ComponentHostingIntegrationTests
     private static string RuntimeConfigPath =>
         Path.Combine(AppContext.BaseDirectory, "HostFxrSharp.Tests.runtimeconfig.json");
 
-    [SkippableFact]
+    [Fact]
     public void LoadsUnmanagedCallersOnlyMethodAndInvokesIt()
     {
         using var context = CreateContextOrSkip();
@@ -41,7 +42,7 @@ public sealed unsafe class ComponentHostingIntegrationTests
         add(20, 22).ShouldBe(42);
     }
 
-    [SkippableFact]
+    [Fact]
     public void LoadsDefaultComponentEntryPoint()
     {
         using var context = CreateContextOrSkip();
@@ -52,7 +53,7 @@ public sealed unsafe class ComponentHostingIntegrationTests
         pointer.ShouldNotBe(0);
     }
 
-    [SkippableFact]
+    [Fact]
     public void LoadsDelegateTypedMethod()
     {
         using var context = CreateContextOrSkip();
@@ -63,7 +64,7 @@ public sealed unsafe class ComponentHostingIntegrationTests
         pointer.ShouldNotBe(0);
     }
 
-    [SkippableFact]
+    [Fact]
     public void LoadingAMissingMethodThrowsHostingException()
     {
         using var context = CreateContextOrSkip();
@@ -76,10 +77,10 @@ public sealed unsafe class ComponentHostingIntegrationTests
     private static HostContext CreateContextOrSkip()
     {
         if (!File.Exists(ComponentAssemblyPath))
-            throw new SkipException($"Test component was not found at '{ComponentAssemblyPath}'.");
+            throw SkipException.ForSkip($"Test component was not found at '{ComponentAssemblyPath}'.");
 
         if (!File.Exists(RuntimeConfigPath))
-            throw new SkipException($"Runtime config was not found at '{RuntimeConfigPath}'.");
+            throw SkipException.ForSkip($"Runtime config was not found at '{RuntimeConfigPath}'.");
 
         try
         {
@@ -87,7 +88,7 @@ public sealed unsafe class ComponentHostingIntegrationTests
         }
         catch (HostingException ex)
         {
-            throw new SkipException($"Could not initialize a host context in this environment: {ex.Message}");
+            throw SkipException.ForSkip($"Could not initialize a host context in this environment: {ex.Message}");
         }
     }
 
@@ -99,7 +100,7 @@ public sealed unsafe class ComponentHostingIntegrationTests
         }
         catch (HostingException ex)
         {
-            throw new SkipException($"The load_assembly_and_get_function_pointer delegate is unavailable: {ex.Message}");
+            throw SkipException.ForSkip($"The load_assembly_and_get_function_pointer delegate is unavailable: {ex.Message}");
         }
     }
 }
