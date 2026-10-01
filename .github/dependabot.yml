@@ -18,6 +18,13 @@ updates:
     open-pull-requests-limit: 10
     commit-message:
       prefix: "build(deps)"
+    ignore:
+      # eslint-config-next still bundles plugins that only support ESLint 9.
+      - dependency-name: "eslint"
+        update-types: ["version-update:semver-major"]
+      # Next.js and typescript-eslint do not support the native TypeScript 7 compiler yet.
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
@@ -26,3 +33,7 @@ updates:
       interval: "weekly"
     commit-message:
       prefix: "ci(deps)"
+    ignore:
+      # Track the floating major tag (@v4) instead of pinning every minor/patch release.
+      - dependency-name: "github/codeql-action"
+        update-types: ["version-update:semver-minor", "version-update:semver-patch"]
