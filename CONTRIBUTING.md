@@ -47,7 +47,7 @@ Files are **UTF-8 (no BOM)**, stored with LF line endings and checked out with y
 
 ## Tests
 
-New behaviour ships with a test. The suite lives in `src/HostFxrSharp.Tests` (xUnit). Prefer tests that are
+New behaviour ships with a test. The suite lives in `src/HostFxrSharp.Tests` (xUnit v3). Prefer tests that are
 deterministic on every OS — for example, verifying that native strings round-trip through their platform
 encoding, or that the resolver picks the right library name and RID for the current platform.
 

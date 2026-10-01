@@ -1,6 +1,7 @@
 ﻿using HostFxrSharp.Exceptions;
 using Shouldly;
 using Xunit;
+using Xunit.Sdk;
 
 namespace HostFxrSharp.Tests;
 
@@ -15,7 +16,7 @@ namespace HostFxrSharp.Tests;
 /// </remarks>
 public sealed class HostFxrLoadingTests
 {
-    [SkippableFact]
+    [Fact]
     public void EnsureLoadedMakesLoadedHostFxrPathAnExistingFile()
     {
         var path = EnsureHostFxrLoadedOrSkip();
@@ -25,7 +26,7 @@ public sealed class HostFxrLoadingTests
         Path.IsPathRooted(path).ShouldBeTrue();
     }
 
-    [SkippableFact]
+    [Fact]
     public void EnsureLoadedIsIdempotentAndKeepsSamePath()
     {
         var first = EnsureHostFxrLoadedOrSkip();
@@ -36,7 +37,7 @@ public sealed class HostFxrLoadingTests
         HostFxr.LoadedHostFxrPath.ShouldBe(first);
     }
 
-    [SkippableFact]
+    [Fact]
     public void LoadFromWithAlreadyLoadedPathIsHarmlessNoOp()
     {
         var path = EnsureHostFxrLoadedOrSkip();
@@ -56,7 +57,7 @@ public sealed class HostFxrLoadingTests
         }
         catch (HostingException ex)
         {
-            throw new SkipException($"A usable hostfxr could not be located or loaded in this environment: {ex.Message}");
+            throw SkipException.ForSkip($"A usable hostfxr could not be located or loaded in this environment: {ex.Message}");
         }
 
         var path = HostFxr.LoadedHostFxrPath;

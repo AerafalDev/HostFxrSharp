@@ -3,6 +3,7 @@ using HostFxrSharp.Exceptions;
 using HostFxrSharp.Resolution;
 using Shouldly;
 using Xunit;
+using Xunit.Sdk;
 
 namespace HostFxrSharp.Tests;
 
@@ -19,7 +20,7 @@ namespace HostFxrSharp.Tests;
 /// </remarks>
 public sealed class NetHostIntegrationTests
 {
-    [SkippableFact]
+    [Fact]
     public void GetHostFxrPathReturnsNonEmptyExistingPath()
     {
         var path = ResolveHostFxrPathOrSkip();
@@ -28,7 +29,7 @@ public sealed class NetHostIntegrationTests
         File.Exists(path).ShouldBeTrue($"expected hostfxr to exist at the resolved path '{path}'.");
     }
 
-    [SkippableFact]
+    [Fact]
     public void GetHostFxrPathReturnsAbsolutePath()
     {
         var path = ResolveHostFxrPathOrSkip();
@@ -36,7 +37,7 @@ public sealed class NetHostIntegrationTests
         Path.IsPathRooted(path).ShouldBeTrue($"expected an absolute path but got '{path}'.");
     }
 
-    [SkippableFact]
+    [Fact]
     public void GetHostFxrPathFileNameMatchesCurrentPlatform()
     {
         var path = ResolveHostFxrPathOrSkip();
@@ -44,7 +45,7 @@ public sealed class NetHostIntegrationTests
         Path.GetFileName(path).ShouldBe(ExpectedHostFxrFileName(), StringCompareShould.IgnoreCase);
     }
 
-    [SkippableFact]
+    [Fact]
     public void GetHostFxrPathWithEmptyOptionsMatchesDefault()
     {
         var withDefault = ResolveHostFxrPathOrSkip();
@@ -57,20 +58,20 @@ public sealed class NetHostIntegrationTests
         }
         catch (HostingException ex)
         {
-            throw new SkipException($"nethost is unavailable in this environment: {ex.Message}");
+            throw SkipException.ForSkip($"nethost is unavailable in this environment: {ex.Message}");
         }
 
         // An options object whose members are all null must resolve identically to passing no options.
         withEmptyOptions.ShouldBe(withDefault);
     }
 
-    [SkippableFact]
+    [Fact]
     public void TryGetHostFxrPathReturnsTrueWithExistingPath()
     {
         var located = NetHost.TryGetHostFxrPath(out var path);
 
         if (!located)
-            throw new SkipException("nethost is unavailable in this environment; TryGetHostFxrPath returned false.");
+            throw SkipException.ForSkip("nethost is unavailable in this environment; TryGetHostFxrPath returned false.");
 
         // [NotNullWhen(true)] guarantees a non-null path once located is true.
         path.ShouldNotBeNullOrWhiteSpace();
@@ -78,7 +79,7 @@ public sealed class NetHostIntegrationTests
         Path.GetFileName(path).ShouldBe(ExpectedHostFxrFileName(), StringCompareShould.IgnoreCase);
     }
 
-    [SkippableFact]
+    [Fact]
     public void TryGetHostFxrPathAgreesWithGetHostFxrPath()
     {
         var expected = ResolveHostFxrPathOrSkip();
@@ -102,7 +103,7 @@ public sealed class NetHostIntegrationTests
         }
         catch (HostingException ex)
         {
-            throw new SkipException($"nethost is unavailable in this environment: {ex.Message}");
+            throw SkipException.ForSkip($"nethost is unavailable in this environment: {ex.Message}");
         }
     }
 

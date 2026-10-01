@@ -1,6 +1,7 @@
 ﻿using HostFxrSharp.Exceptions;
 using Shouldly;
 using Xunit;
+using Xunit.Sdk;
 
 namespace HostFxrSharp.Tests;
 
@@ -17,7 +18,7 @@ public sealed class ActiveRuntimePropertiesTests
 
     private const string ObviouslyAbsentProperty = "HOSTFXRSHARP_DEFINITELY_ABSENT_PROPERTY_9F3C1A7E";
 
-    [SkippableFact]
+    [Fact]
     public void GetActiveRuntimePropertiesReturnsNonEmptyDictionary()
     {
         try
@@ -31,11 +32,11 @@ public sealed class ActiveRuntimePropertiesTests
         }
         catch (HostingException ex)
         {
-            throw new SkipException($"Active runtime properties are unavailable in this environment: {ex.Message}");
+            throw SkipException.ForSkip($"Active runtime properties are unavailable in this environment: {ex.Message}");
         }
     }
 
-    [SkippableFact]
+    [Fact]
     public void AllActivePropertyKeysAndValuesDecodeCleanly()
     {
         try
@@ -60,11 +61,11 @@ public sealed class ActiveRuntimePropertiesTests
         }
         catch (HostingException ex)
         {
-            throw new SkipException($"Active runtime properties are unavailable in this environment: {ex.Message}");
+            throw SkipException.ForSkip($"Active runtime properties are unavailable in this environment: {ex.Message}");
         }
     }
 
-    [SkippableFact]
+    [Fact]
     public void TrustedPlatformAssembliesDecodesToLongSemicolonSeparatedList()
     {
         try
@@ -87,11 +88,11 @@ public sealed class ActiveRuntimePropertiesTests
         }
         catch (HostingException ex)
         {
-            throw new SkipException($"Active runtime properties are unavailable in this environment: {ex.Message}");
+            throw SkipException.ForSkip($"Active runtime properties are unavailable in this environment: {ex.Message}");
         }
     }
 
-    [SkippableFact]
+    [Fact]
     public void TryGetActiveRuntimePropertyReturnsFalseForAbsentProperty()
     {
         try
@@ -105,11 +106,11 @@ public sealed class ActiveRuntimePropertiesTests
         }
         catch (HostingException ex)
         {
-            throw new SkipException($"Active runtime properties are unavailable in this environment: {ex.Message}");
+            throw SkipException.ForSkip($"Active runtime properties are unavailable in this environment: {ex.Message}");
         }
     }
 
-    [SkippableFact]
+    [Fact]
     public void TryGetActiveRuntimePropertyAgreesWithSnapshotForEveryKey()
     {
         try
@@ -132,11 +133,11 @@ public sealed class ActiveRuntimePropertiesTests
         }
         catch (HostingException ex)
         {
-            throw new SkipException($"Active runtime properties are unavailable in this environment: {ex.Message}");
+            throw SkipException.ForSkip($"Active runtime properties are unavailable in this environment: {ex.Message}");
         }
     }
 
-    [SkippableTheory]
+    [Theory]
     [InlineData("TRUSTED_PLATFORM_ASSEMBLIES")]
     [InlineData("NATIVE_DLL_SEARCH_DIRECTORIES")]
     [InlineData("PLATFORM_RESOURCE_ROOTS")]
@@ -151,18 +152,18 @@ public sealed class ActiveRuntimePropertiesTests
             HostFxr.EnsureLoaded();
 
             if (!HostFxr.TryGetActiveRuntimeProperty(name, out var value))
-                throw new SkipException($"Runtime property '{name}' is not present in this environment.");
+                throw SkipException.ForSkip($"Runtime property '{name}' is not present in this environment.");
 
             value.ShouldNotContain('\0');
             value.ShouldNotContain('�');
         }
         catch (HostingException ex)
         {
-            throw new SkipException($"Active runtime properties are unavailable in this environment: {ex.Message}");
+            throw SkipException.ForSkip($"Active runtime properties are unavailable in this environment: {ex.Message}");
         }
     }
 
-    [SkippableTheory]
+    [Theory]
     [InlineData(null)]
     [InlineData("")]
     public void TryGetActiveRuntimePropertyRejectsNullOrEmptyName(string? name)
